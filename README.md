@@ -12,7 +12,7 @@ DEMO LINK: [link](https://stocksimv2.frogwebservices.com/)
 - **Leaderboard**: Compete with other traders
 - **Transaction History**: View all your past trades
 - **Anti-Cheat System**: Rate limiting, suspicious activity detection, and trade validation
-- **Modern UI**: Robinhood-inspired dark theme interface
+- **Modern UI**
 
 ## Security Features
 
