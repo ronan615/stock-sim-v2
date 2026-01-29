@@ -100,5 +100,5 @@ stock-sim-v2/
 
 ## Notes
 - No separate HTML files since nodejs server does everything 
-- Highly maintainable with minimal comments
+- Highly maintainable with minimal components
 - Server now handles transactions so no trust is needed on client side to prevent spoofing like the v1
