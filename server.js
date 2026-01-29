@@ -6,6 +6,8 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const SESSION_DURATION = 30 * 24 * 60 * 60 * 1000;
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -154,20 +156,38 @@ const rateLimit = (req, res, next) => {
 
 const validateSession = (req, res, next) => {
     const token = req.headers['x-session-token'];
-    
+
     if (!token) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
-    
-    const session = activeSessions.get(token);
-    if (!session || Date.now() - session.lastActivity > 3600000) {
-        activeSessions.delete(token);
-        return res.status(401).json({ error: 'Session expired' });
+
+    // Check in-memory active sessions first
+    let session = activeSessions.get(token);
+
+    if (session) {
+        // session expiry handled via expires if present, and short inactivity expiry (1 hour)
+        const now = Date.now();
+        if ((session.expires && now > session.expires) || (now - session.lastActivity > 3600000)) {
+            activeSessions.delete(token);
+            session = null;
+        } else {
+            session.lastActivity = now;
+            req.userId = session.userId;
+            return next();
+        }
     }
-    
-    session.lastActivity = Date.now();
-    req.userId = session.userId;
-    next();
+
+    // Fallback: look for persistent token in stored users
+    const userWithToken = Object.values(users).find(u => Array.isArray(u.persistentSessions) && u.persistentSessions.some(s => s.token === token && s.expires > Date.now()));
+    if (userWithToken) {
+        // restore into activeSessions for quicker checks
+        const sess = userWithToken.persistentSessions.find(s => s.token === token);
+        activeSessions.set(token, { userId: userWithToken.userId, lastActivity: Date.now(), expires: sess.expires });
+        req.userId = userWithToken.userId;
+        return next();
+    }
+
+    return res.status(401).json({ error: 'Session expired or invalid' });
 };
 
 const logSuspiciousActivity = (identifier, type, details) => {
@@ -289,6 +309,7 @@ app.post('/api/register', (req, res) => {
         tutorialStep: 0,
         tutorialCompleted: false,
         uiTutorialCompleted: false,
+        persistentSessions: [],
         createdAt: Date.now(),
         lastActivity: Date.now()
     };
@@ -296,7 +317,10 @@ app.post('/api/register', (req, res) => {
     saveUsers();
     
     const token = generateSessionToken();
-    activeSessions.set(token, { userId, lastActivity: Date.now() });
+    activeSessions.set(token, { userId, lastActivity: Date.now(), expires: Date.now() + SESSION_DURATION });
+    // persist token so users stay logged in across restarts
+    users[userId].persistentSessions = users[userId].persistentSessions || [];
+    users[userId].persistentSessions.push({ token, expires: Date.now() + SESSION_DURATION });
     
     res.json({ 
         token, 
@@ -305,7 +329,8 @@ app.post('/api/register', (req, res) => {
         cash: users[userId].cash,
         tutorialStep: 0,
         tutorialCompleted: false,
-        uiTutorialCompleted: false
+        uiTutorialCompleted: false,
+        sessionExpires: Date.now() + SESSION_DURATION
     });
 });
 
@@ -327,11 +352,15 @@ app.post('/api/login', (req, res) => {
     }
     
     const token = generateSessionToken();
-    activeSessions.set(token, { userId: user.userId, lastActivity: Date.now() });
-    
+    activeSessions.set(token, { userId: user.userId, lastActivity: Date.now(), expires: Date.now() + SESSION_DURATION });
+
+    // store persistent session on user so token survives server restart
+    user.persistentSessions = user.persistentSessions || [];
+    user.persistentSessions.push({ token, expires: Date.now() + SESSION_DURATION });
+
     user.lastActivity = Date.now();
     saveUsers();
-    
+
     res.json({ 
         token,
         userId: user.userId,
@@ -340,7 +369,8 @@ app.post('/api/login', (req, res) => {
         portfolio: user.portfolio,
         tutorialStep: user.tutorialStep || 0,
         tutorialCompleted: user.tutorialCompleted || false,
-        uiTutorialCompleted: user.uiTutorialCompleted || false
+        uiTutorialCompleted: user.uiTutorialCompleted || false,
+        sessionExpires: Date.now() + SESSION_DURATION
     });
 });
 
@@ -358,6 +388,29 @@ app.get('/api/portfolio', validateSession, (req, res) => {
         tutorialCompleted: user.tutorialCompleted || false,
         uiTutorialCompleted: user.uiTutorialCompleted || false
     });
+});
+
+// Logout endpoint: remove session token both in-memory and from user's persistent sessions
+app.post('/api/logout', (req, res) => {
+    const token = req.headers['x-session-token'];
+    if (!token) return res.status(400).json({ error: 'No token provided' });
+
+    activeSessions.delete(token);
+
+    // remove from any user's persistentSessions
+    for (const userId in users) {
+        const user = users[userId];
+        if (Array.isArray(user.persistentSessions)) {
+            const idx = user.persistentSessions.findIndex(s => s.token === token);
+            if (idx !== -1) {
+                user.persistentSessions.splice(idx, 1);
+                saveUsers();
+                break;
+            }
+        }
+    }
+
+    res.json({ success: true });
 });
 
 app.get('/api/tutorial/current', validateSession, (req, res) => {
@@ -614,6 +667,182 @@ app.get('/api/transactions', validateSession, (req, res) => {
         .slice(0, 100);
     
     res.json(userTransactions);
+});
+
+const renderAuthPage = (mode) => {
+    const isLogin = mode === 'login';
+    const pageTitle = isLogin ? 'Sign In to StockSim' : 'Create your StockSim account';
+    const primaryAction = isLogin ? 'Sign In' : 'Create Account';
+    const secondaryText = isLogin ? "Don't have an account yet?" : 'Already trading with StockSim?';
+    const secondaryLinkText = isLogin ? 'Create one' : 'Sign in';
+    const secondaryHref = isLogin ? '/register' : '/login';
+    const apiPath = isLogin ? '/api/login' : '/api/register';
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${primaryAction} | StockSim</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: radial-gradient(circle at top, #1c1c1e, #050505 60%);
+            color: #fff;
+            min-height: 100vh;
+        }
+        .auth-wrapper {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .auth-card {
+            width: 100%;
+            max-width: 420px;
+            background: rgba(18, 18, 20, 0.9);
+            border-radius: 20px;
+            padding: 48px 40px;
+            box-shadow: 0 30px 70px rgba(0, 0, 0, 0.65);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .auth-card h1 {
+            margin-bottom: 12px;
+            font-size: 36px;
+        }
+        .auth-card p {
+            margin-bottom: 32px;
+            color: #bfbfbf;
+            line-height: 1.5;
+        }
+        .input-group {
+            margin-bottom: 18px;
+        }
+        .input-group label {
+            display: block;
+            font-size: 13px;
+            color: #9ca3af;
+            margin-bottom: 6px;
+        }
+        .input-group input {
+            width: 100%;
+            padding: 14px 16px;
+            border-radius: 10px;
+            border: 1px solid #2c2c2e;
+            background: #0c0c0e;
+            color: #fff;
+            font-size: 16px;
+            transition: border-color 0.2s ease;
+        }
+        .input-group input:focus {
+            outline: none;
+            border-color: #6bbf33;
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            background: linear-gradient(135deg, #6bbf33, #8ddf55);
+            color: #000;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 12px 30px rgba(107, 191, 51, 0.35);
+        }
+        .switch-line {
+            margin-top: 18px;
+            text-align: center;
+            color: #8a8a8a;
+            font-size: 14px;
+        }
+        .switch-line a {
+            color: #6bbf33;
+            text-decoration: none;
+        }
+        .error-message {
+            margin-top: 18px;
+            font-size: 14px;
+            color: #ff6b6b;
+            min-height: 20px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="auth-wrapper">
+        <div class="auth-card">
+            <h1>StockSim</h1>
+            <p>${pageTitle}. Trade with live data and friendly insights.</p>
+            <div class="input-group">
+                <label for="username">Username</label>
+                <input id="username" type="text" placeholder="Choose a username" autocomplete="username">
+            </div>
+            <div class="input-group">
+                <label for="password">Password</label>
+                <input id="password" type="password" placeholder="Create a password" autocomplete="current-password">
+            </div>
+            <button id="authButton" class="btn" type="button" onclick="submitAuth()">${primaryAction}</button>
+            <div class="switch-line">
+                ${secondaryText} <a href="${secondaryHref}">${secondaryLinkText}</a>
+            </div>
+            <div id="errorMessage" class="error-message"></div>
+        </div>
+    </div>
+    <script>
+        async function submitAuth() {
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+            const errorEl = document.getElementById('errorMessage');
+            errorEl.textContent = '';
+
+            if (!username || !password) {
+                errorEl.textContent = 'Username and password are required.';
+                return;
+            }
+
+            try {
+                const response = await fetch('${apiPath}', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await response.json();
+
+                if (response.ok) {
+                    localStorage.setItem('sessionToken', data.token);
+                    window.location.href = '/';
+                } else {
+                    errorEl.textContent = data.error || 'Authentication failed.';
+                }
+            } catch (error) {
+                errorEl.textContent = 'Unable to reach the server.';
+            }
+        }
+
+        document.getElementById('password').addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') submitAuth();
+        });
+    </script>
+</body>
+</html>`;
+};
+
+app.get('/login', (req, res) => {
+    res.send(renderAuthPage('login'));
+});
+
+app.get('/register', (req, res) => {
+    res.send(renderAuthPage('register'));
 });
 
 app.get('/', (req, res) => {
@@ -1382,36 +1611,15 @@ app.get('/', (req, res) => {
         </div>
     </div>
 
-    <div id="loginContainer" class="login-container">
-
-        <div class="login-box">
-            <div class="logo">
-                <h1>StockSim</h1>
-            </div>
-            <div class="input-group">
-                <label for="username">Username</label>
-                <input type="text" id="username" placeholder="Enter username" autocomplete="username">
-            </div>
-            <div class="input-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" placeholder="Enter password" autocomplete="current-password">
-            </div>
-            <button class="btn" onclick="login()">Sign In</button>
-            <button class="btn btn-secondary" onclick="register()">Create Account</button>
-            <div id="errorMessage" class="error-message"></div>
-        </div>
-    </div>
-
     <div id="appContainer" class="app-container">
         <div class="header">
             <div class="header-left">
                 <div class="header-logo">StockSim</div>
                 <nav class="nav-tabs">
-                    <a href="#" class="nav-tab active" onclick="showTab('trading')">Trading</a>
-                    <a href="#" class="nav-tab" onclick="showTab('portfolio')">Portfolio</a>
-                    <a href="#" class="nav-tab" onclick="showTab('leaderboard')">Leaderboard</a>
-                    <a href="#" class="nav-tab" onclick="showTab('history')">History</a>
-                    <a href="#" class="nav-tab" onclick="showTab('tutorial')">Tutorial</a>
+                    <a href="#" class="nav-tab active" data-tab="trading" onclick="showTab(event, 'trading')">Trading</a>
+                    <a href="#" class="nav-tab" data-tab="portfolio" onclick="showTab(event, 'portfolio')">Portfolio</a>
+                    <a href="#" class="nav-tab" data-tab="leaderboard" onclick="showTab(event, 'leaderboard')">Leaderboard</a>
+                    <a href="#" class="nav-tab" data-tab="history" onclick="showTab(event, 'history')">History</a>
                 </nav>
             </div>
             <div class="header-right">
@@ -1465,32 +1673,6 @@ app.get('/', (req, res) => {
                     </div>
                 </div>
 
-                <div id="tutorialTab" class="tab-content" style="display: none;">
-                    <div class="card">
-                        <div class="card-header">
-                            <h2 class="card-title">Tutorial</h2>
-                        </div>
-                        <div id="tutorialContent" style="padding: 16px; color: #ccc; font-size: 15px; line-height: 1.6;">
-                            <p>Welcome to StockSim — follow the steps below:</p>
-                            <ol>
-                                <li>Create an account (top-left).</li>
-                                <li>Search a stock symbol (e.g., AAPL) in Trading.</li>
-                                <li>Use the Buy/Sell panel to place trades.</li>
-                                <li>Check your Portfolio and History to review performance.</li>
-                            </ol>
-                            <div style="text-align:center; margin-top:16px;">
-                                <button class="btn" onclick="startTutorial()">Start Guided Tour</button>
-                            </div>
-                            <div id="tutorialStep" style="margin-top:16px; display:none;">
-                                <div id="tutorialText" style="margin-bottom:12px;"></div>
-                                <div style="display:flex; gap:8px; justify-content:center;">
-                                    <button class="btn btn-secondary" onclick="prevTutorialStep()">Back</button>
-                                    <button class="btn" onclick="nextTutorialStep()">Next</button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
             </div>
 
             <div class="content-right">
@@ -1517,13 +1699,44 @@ app.get('/', (req, res) => {
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
         let sessionToken = null;
-        let currentUserId = null;
         let currentUsername = null;
         let currentCash = 0;
         let currentPortfolio = {};
         let currentSymbol = null;
         let chartInstance = null;
         let currentRange = '1d';
+
+        document.addEventListener('DOMContentLoaded', initApp);
+
+        async function initApp() {
+            const storedToken = localStorage.getItem('sessionToken');
+            if (!storedToken) {
+                window.location.href = '/login';
+                return;
+            }
+
+            sessionToken = storedToken;
+
+            try {
+                const response = await fetch('/api/portfolio', {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+
+                if (!response.ok) {
+                    throw new Error('Session expired');
+                }
+
+                const data = await response.json();
+                currentCash = data.cash;
+                currentPortfolio = data.portfolio;
+                currentUsername = data.username;
+                document.getElementById('appContainer').style.display = 'block';
+                showApp();
+            } catch (error) {
+                localStorage.removeItem('sessionToken');
+                window.location.href = '/login';
+            }
+        }
 
         function showToast(message, type = 'success') {
             const toast = document.createElement('div');
@@ -1545,75 +1758,16 @@ app.get('/', (req, res) => {
             return new Intl.NumberFormat('en-US').format(value);
         }
 
-        async function register() {
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const errorEl = document.getElementById('errorMessage');
-
-            try {
-                const response = await fetch('/api/register', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
-                });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    sessionToken = data.token;
-                    currentUserId = data.userId;
-                    currentUsername = data.username;
-                    currentCash = data.cash;
-                    showApp();
-                } else {
-                    errorEl.textContent = data.error;
-                }
-            } catch (error) {
-                errorEl.textContent = 'Connection error';
-            }
-        }
-
-        async function login() {
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const errorEl = document.getElementById('errorMessage');
-
-            try {
-                const response = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
-                });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    sessionToken = data.token;
-                    currentUserId = data.userId;
-                    currentUsername = data.username;
-                    currentCash = data.cash;
-                    currentPortfolio = data.portfolio;
-                    showApp();
-                } else {
-                    errorEl.textContent = data.error;
-                }
-            } catch (error) {
-                errorEl.textContent = 'Connection error';
-            }
-        }
-
         function logout() {
             sessionToken = null;
-            currentUserId = null;
             currentUsername = null;
             currentCash = 0;
             currentPortfolio = {};
-            document.getElementById('loginContainer').style.display = 'flex';
-            document.getElementById('appContainer').style.display = 'none';
+            localStorage.removeItem('sessionToken');
+            window.location.href = '/login';
         }
 
         function showApp() {
-            document.getElementById('loginContainer').style.display = 'none';
             document.getElementById('appContainer').style.display = 'block';
             updateHeader();
             refreshPortfolio();
@@ -1634,13 +1788,13 @@ app.get('/', (req, res) => {
                 {
                     element: '#symbolSearch',
                     title: 'Search for Stocks',
-                    text: 'Start by searching for a stock ticker symbol. Try searching for "AAPL" (Apple Inc.).',
+                    text: 'Start by searching for a stock ticker symbol. Try typing "AAPL" (Apple Inc.).',
                     action: 'type-aapl'
                 },
                 {
                     element: '#symbolSearch',
                     title: 'Load the Stock',
-                    text: 'Press Enter or click outside to load the stock information and chart.',
+                    text: 'Press Enter to load the stock information and chart.',
                     action: 'load-stock'
                 },
                 {
@@ -1652,16 +1806,19 @@ app.get('/', (req, res) => {
                 {
                     element: '.trade-btn.buy',
                     title: 'Execute Your Trade',
-                    text: 'Click the "Buy" button to purchase the shares. Your portfolio will be updated automatically.',
+                    text: 'Click the "Buy" button to place your order. The tutorial will continue once the buy succeeds.',
                     action: 'click-buy'
                 },
                 {
                     element: '.header-right',
-                    title: 'Track Your Progress',
-                    text: 'Your cash balance and portfolio are displayed here. Check the Portfolio tab to see your holdings!',
-                    action: 'complete'
+                    title: 'View Portfolio',
+                    text: 'Great — your trade completed. Check your Portfolio to review holdings and performance.',
+                    action: 'view-portfolio'
                 }
-            ]
+            ],
+            // runtime flags
+            waitingForBuy: false,
+            listeners: {}
         };
 
         async function checkAndShowTutorial() {
@@ -1699,16 +1856,18 @@ app.get('/', (req, res) => {
             document.getElementById('tutorialQuestion').textContent = lesson.question;
 
             const optionsContainer = document.getElementById('tutorialOptions');
-            optionsContainer.innerHTML = '';
 
-            lesson.options.forEach((option, index) => {
-                const optionDiv = document.createElement('div');
-                optionDiv.className = 'quiz-option';
-                optionDiv.textContent = option;
-                optionDiv.onclick = () => selectTutorialOption(index);
-                optionsContainer.appendChild(optionDiv);
-            });
+            const rect = targetElement.getBoundingClientRect();
+            const scrollX = window.scrollX || window.pageXOffset || 0;
+            const scrollY = window.scrollY || window.pageYOffset || 0;
 
+            spotlight.style.left = (rect.left + scrollX - 10) + 'px';
+            spotlight.style.top = (rect.top + scrollY - 10) + 'px';
+            spotlight.style.width = (rect.width + 20) + 'px';
+            spotlight.style.height = (rect.height + 20) + 'px';
+
+            tooltip.style.left = (rect.left + scrollX + rect.width / 2 - 175) + 'px';
+            tooltip.style.top = (rect.bottom + scrollY + 20) + 'px';
             document.getElementById('tutorialFeedback').style.display = 'none';
             document.getElementById('tutorialSubmit').disabled = true;
 
@@ -1809,20 +1968,63 @@ app.get('/', (req, res) => {
             }
 
             const rect = targetElement.getBoundingClientRect();
+            const scrollX = window.scrollX || window.pageXOffset || 0;
+            const scrollY = window.scrollY || window.pageYOffset || 0;
 
-            spotlight.style.left = (rect.left - 10) + 'px';
-            spotlight.style.top = (rect.top - 10) + 'px';
+            spotlight.style.left = (rect.left + scrollX - 10) + 'px';
+            spotlight.style.top = (rect.top + scrollY - 10) + 'px';
             spotlight.style.width = (rect.width + 20) + 'px';
             spotlight.style.height = (rect.height + 20) + 'px';
 
-            tooltip.style.left = (rect.left + rect.width / 2 - 175) + 'px';
-            tooltip.style.top = (rect.bottom + 20) + 'px';
+            tooltip.style.left = (rect.left + scrollX + rect.width / 2 - 175) + 'px';
+            tooltip.style.top = (rect.bottom + scrollY + 20) + 'px';
 
             document.getElementById('uiTutorialTitle').textContent = step.title;
             document.getElementById('uiTutorialText').textContent = step.text;
             document.getElementById('uiTutorialStep').textContent = \`Step \${uiTutorialState.currentStep + 1} of \${uiTutorialState.steps.length}\`;
 
             overlay.style.display = 'block';
+
+            // attach action listeners depending on the step
+            // remove any previous listeners first
+            try { detachUITutorialListeners(); } catch (e) {}
+
+            if (step.action === 'type-aapl') {
+                const input = document.getElementById('symbolSearch');
+                const handler = (e) => {
+                    if (input.value.trim().toUpperCase() === 'AAPL') {
+                        input.removeEventListener('input', handler);
+                        nextUITutorialStep();
+                    }
+                };
+                uiTutorialState.listeners.typeAapl = handler;
+                input.addEventListener('input', handler);
+            } else if (step.action === 'load-stock') {
+                // poll for currentSymbol to be AAPL (triggered by Enter)
+                const interval = setInterval(() => {
+                    if (currentSymbol && currentSymbol.toUpperCase() === 'AAPL') {
+                        clearInterval(interval);
+                        nextUITutorialStep();
+                    }
+                }, 400);
+                uiTutorialState.listeners.loadInterval = interval;
+            } else if (step.action === 'enter-quantity') {
+                const qty = document.getElementById('tradeQuantity');
+                const handler = (e) => {
+                    const val = parseInt(qty.value, 10);
+                    if (!isNaN(val) && val >= 1) {
+                        qty.removeEventListener('input', handler);
+                        nextUITutorialStep();
+                    }
+                };
+                uiTutorialState.listeners.enterQty = handler;
+                qty.addEventListener('input', handler);
+            } else if (step.action === 'click-buy') {
+                // set a flag; progression will occur only when buyStock reports success
+                uiTutorialState.waitingForBuy = true;
+            } else if (step.action === 'view-portfolio') {
+                // nothing to attach; user can view portfolio
+            }
         }
 
         function nextUITutorialStep() {
@@ -1840,6 +2042,28 @@ app.get('/', (req, res) => {
             } else {
                 showUITutorialStep();
             }
+        }
+
+        function detachUITutorialListeners() {
+            try {
+                if (uiTutorialState.listeners.typeAapl) {
+                    const input = document.getElementById('symbolSearch');
+                    input.removeEventListener('input', uiTutorialState.listeners.typeAapl);
+                    delete uiTutorialState.listeners.typeAapl;
+                }
+                if (uiTutorialState.listeners.loadInterval) {
+                    clearInterval(uiTutorialState.listeners.loadInterval);
+                    delete uiTutorialState.listeners.loadInterval;
+                }
+                if (uiTutorialState.listeners.enterQty) {
+                    const qty = document.getElementById('tradeQuantity');
+                    qty.removeEventListener('input', uiTutorialState.listeners.enterQty);
+                    delete uiTutorialState.listeners.enterQty;
+                }
+            } catch (e) {
+                // ignore
+            }
+            uiTutorialState.waitingForBuy = false;
         }
 
 
@@ -1915,7 +2139,7 @@ app.get('/', (req, res) => {
         }
 
         function loadStockFromPortfolio(symbol) {
-            showTab('trading');
+            showTab(null, 'trading');
             document.getElementById('symbolSearch').value = symbol;
             loadStock();
         }
@@ -2116,6 +2340,17 @@ app.get('/', (req, res) => {
                     loadStock();
                     showToast(\`Bought \${quantity} shares of \${currentSymbol}\`);
                     document.getElementById('tradeQuantity').value = '';
+
+                    // If the UI tutorial is waiting for a buy action, advance the tutorial
+                    try {
+                        if (typeof uiTutorialState !== 'undefined' && uiTutorialState.waitingForBuy) {
+                            uiTutorialState.waitingForBuy = false;
+                            try { detachUITutorialListeners(); } catch (e) {}
+                            nextUITutorialStep();
+                        }
+                    } catch (e) {
+                        // ignore if tutorial state not available
+                    }
                 } else {
                     showToast(data.error, 'error');
                 }
@@ -2163,11 +2398,15 @@ app.get('/', (req, res) => {
             }
         }
 
-        async function showTab(tabName) {
+        async function showTab(event, tabName) {
+            if (event) event.preventDefault();
             document.querySelectorAll('.nav-tab').forEach(tab => tab.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(content => content.style.display = 'none');
             
-            event.target.classList.add('active');
+            const tabSelector = '.nav-tab[data-tab="' + tabName + '"]';
+            const activeTab = event ? event.currentTarget : document.querySelector(tabSelector);
+            if (activeTab) activeTab.classList.add('active');
+
             const el = document.getElementById(tabName + 'Tab');
             if (el) el.style.display = 'block';
 
@@ -2177,8 +2416,6 @@ app.get('/', (req, res) => {
                 await loadLeaderboardTab();
             } else if (tabName === 'history') {
                 await loadHistoryTab();
-            } else if (tabName === 'tutorial') {
-                // tutorial tab is static; UI handled in tutorial functions
             }
         }
 
@@ -2319,32 +2556,6 @@ app.get('/', (req, res) => {
             } catch (error) {
                 container.innerHTML = '<div class="empty-state"><p>Error loading history</p></div>';
             }
-        }
-
-        // Tutorial state
-        const tutorialSteps = [
-            'Welcome — create an account to get started.',
-            'Search a stock symbol using the search box.',
-            'Use the Buy button to purchase shares at market price.',
-            'Check Portfolio to review holdings and performance.',
-            'Open History to see a record of your trades.'
-        ];
-        let tutorialIndex = 0;
-
-        function startTutorial() {
-            tutorialIndex = 0;
-            document.getElementById('tutorialStep').style.display = 'block';
-            document.getElementById('tutorialText').textContent = tutorialSteps[tutorialIndex];
-        }
-
-        function nextTutorialStep() {
-            if (tutorialIndex < tutorialSteps.length - 1) tutorialIndex++;
-            document.getElementById('tutorialText').textContent = tutorialSteps[tutorialIndex];
-        }
-
-        function prevTutorialStep() {
-            if (tutorialIndex > 0) tutorialIndex--;
-            document.getElementById('tutorialText').textContent = tutorialSteps[tutorialIndex];
         }
 
         setInterval(() => {
