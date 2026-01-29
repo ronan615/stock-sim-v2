@@ -1,6 +1,6 @@
 # Stock Trading Simulator v2
 
-A modern stock trading simulator with real-time market data and a Robinhood-inspired interface.
+A modern stock trading simulator with real-time market data using Yahoo Finance API. 
 <br/>
 DEMO LINK: [link](https://stocksimv2.frogwebservices.com/)
 ## Features
