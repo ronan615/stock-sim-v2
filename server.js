@@ -31,6 +31,11 @@ const newsParser = new Parser({
         item: ['media:content', 'media:thumbnail']
     }
 }); // fixed it 
+const ensureUserDefaults = (user) => {
+    if (!user) return;
+    if (!Array.isArray(user.challengesClaimed)) user.challengesClaimed = [];
+    if (!Array.isArray(user.unlockedFeatures)) user.unlockedFeatures = [];
+};
 //non hard coded tutorial lessons so you can add more later here if you fork the repository just make sure it follows the same format
 const TUTORIAL_LESSONS = [ 
     {
@@ -114,6 +119,33 @@ const TUTORIAL_LESSONS = [
     }
 ];
 
+const SHORT_TERM_CHALLENGES = [
+    {
+        id: 'first-trade',
+        title: 'First Trade',
+        description: 'Complete any buy or sell order.',
+        reward: 500
+    },
+    {
+        id: 'five-shares',
+        title: 'Build a Position',
+        description: 'Hold at least 5 shares of any single stock.',
+        reward: 750
+    },
+    {
+        id: 'diversify-two',
+        title: 'Diversify',
+        description: 'Own positions in at least 2 different symbols.',
+        reward: 1000
+    },
+    {
+        id: 'finish-tutorial',
+        title: 'Complete the Tutorial',
+        description: 'Finish the financial education tutorial.',
+        reward: 500
+    }
+];
+
 const loadData = () => {
     try {
         if (fs.existsSync(USERS_FILE)) {
@@ -146,6 +178,7 @@ const saveTransactions = () => {
 };
 
 loadData();
+Object.values(users).forEach(ensureUserDefaults);
 
 const legacyHashPassword = (password) => {
     return crypto.createHash('sha256').update(password).digest('hex');
@@ -280,6 +313,7 @@ const fetchStockChart = async (symbol, range = '1d', interval = '5m') => {
         const lows = quote.low || [];
         const closes = quote.close || [];
         const candlestick = [];
+        let lastKnownClose = null;
 
         for (let i = 0; i < timestamps.length; i++) {
             const o = opens[i];
@@ -287,17 +321,22 @@ const fetchStockChart = async (symbol, range = '1d', interval = '5m') => {
             const l = lows[i];
             const c = closes[i];
 
-            if ([o, h, l, c].some(value => typeof value !== 'number')) {
-                continue;
+            let bar;
+
+            if ([o, h, l, c].every(value => typeof value === 'number')) {
+                bar = { x: timestamps[i] * 1000, o, h, l, c };
+            } else if (typeof c === 'number') {
+
+                bar = { x: timestamps[i] * 1000, o: c, h: c, l: c, c };
+            } else if (lastKnownClose !== null) {
+                
+                bar = { x: timestamps[i] * 1000, o: lastKnownClose, h: lastKnownClose, l: lastKnownClose, c: lastKnownClose };
             }
 
-            candlestick.push({
-                x: timestamps[i] * 1000,
-                o,
-                h,
-                l,
-                c
-            });
+            if (bar) {
+                candlestick.push(bar);
+                lastKnownClose = bar.c;
+            }
         }
 
         const lastClose = candlestick.length ? candlestick[candlestick.length - 1].c : closes[closes.length - 1];
@@ -331,6 +370,41 @@ const fetchNewsFeed = async (url) => {
         publishedAt: item.pubDate || item.isoDate || null,
         imageUrl: extractNewsImage(item)
     }));
+};
+
+const isChallengeComplete = (challengeId, user, userId) => {
+    const portfolio = user?.portfolio || {};
+    const userTransactions = transactions.filter(t => t.userId === userId);
+
+    switch (challengeId) {
+        case 'first-trade':
+            return userTransactions.length > 0;
+        case 'five-shares':
+            return Object.values(portfolio).some(position => position.quantity >= 5);
+        case 'diversify-two':
+            return Object.keys(portfolio).length >= 2;
+        case 'finish-tutorial':
+            return !!user?.tutorialCompleted;
+        default:
+            return false;
+    }
+};
+
+const getChallengeStatuses = (userId) => {
+    const user = users[userId];
+    ensureUserDefaults(user);
+    return SHORT_TERM_CHALLENGES.map(challenge => {
+        const claimed = user.challengesClaimed.includes(challenge.id);
+        const completed = isChallengeComplete(challenge.id, user, userId);
+        return {
+            id: challenge.id,
+            title: challenge.title,
+            description: challenge.description,
+            reward: challenge.reward,
+            completed,
+            claimed
+        };
+    });
 };
 
 app.use(rateLimit);
@@ -368,9 +442,12 @@ app.post('/api/register', async (req, res) => {
         tutorialStep: 0,
         tutorialCompleted: false,
         uiTutorialCompleted: false,
+        challengesClaimed: [],
+        unlockedFeatures: [],
         createdAt: Date.now(),
         lastActivity: Date.now()
     };
+    ensureUserDefaults(users[userId]);
     
     saveUsers();
     
@@ -383,7 +460,9 @@ app.post('/api/register', async (req, res) => {
         cash: users[userId].cash,
         tutorialStep: 0,
         tutorialCompleted: false,
-        uiTutorialCompleted: false
+        uiTutorialCompleted: false,
+        challengesClaimed: [],
+        unlockedFeatures: []
     });
 });
 
@@ -403,6 +482,8 @@ app.post('/api/login', async (req, res) => {
         logSuspiciousActivity(req.ip, 'FAILED_LOGIN', username);
         return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    ensureUserDefaults(user);
     
     // Check password (support both bcrypt and legacy sha256)
     let isValid = false;
@@ -441,7 +522,9 @@ app.post('/api/login', async (req, res) => {
         portfolio: user.portfolio,
         tutorialStep: user.tutorialStep || 0,
         tutorialCompleted: user.tutorialCompleted || false,
-        uiTutorialCompleted: user.uiTutorialCompleted || false
+        uiTutorialCompleted: user.uiTutorialCompleted || false,
+        challengesClaimed: user.challengesClaimed,
+        unlockedFeatures: user.unlockedFeatures
     });
 });
 
@@ -493,7 +576,7 @@ app.get('/api/tutorial/current', validateSession, (req, res) => {
     });
 });
 
-app.post('/api/tutorial/answer', validateSession, (req, res) => {
+app.post('/api/tutorial/answer', validateSession, (req, res) => { //client side cjecl
     const { answerIndex } = req.body;
     const user = users[req.userId];
     
@@ -550,6 +633,57 @@ app.post('/api/tutorial/ui-complete', validateSession, (req, res) => {
     saveUsers();
     
     res.json({ success: true });
+});
+
+app.get('/api/challenges', validateSession, (req, res) => {
+    const user = users[req.userId];
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const challenges = getChallengeStatuses(req.userId);
+    res.json({ challenges, cash: user.cash });
+});
+
+app.post('/api/challenges/:id/claim', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { id } = req.params;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const challenge = SHORT_TERM_CHALLENGES.find(c => c.id === id);
+    if (!challenge) {
+        return res.status(404).json({ error: 'Challenge not found' });
+    }
+
+    const completed = isChallengeComplete(id, user, req.userId);
+    const alreadyClaimed = user.challengesClaimed.includes(id);
+
+    if (!completed) {
+        return res.status(400).json({ error: 'Challenge not completed yet' });
+    }
+    if (alreadyClaimed) {
+        return res.status(400).json({ error: 'Challenge already claimed' });
+    }
+
+    user.cash += challenge.reward;
+    user.challengesClaimed.push(id);
+
+    saveUsers();
+
+    const challenges = getChallengeStatuses(req.userId);
+
+    res.json({
+        success: true,
+        reward: challenge.reward,
+        cash: user.cash,
+        challenges
+    });
 });
 
 app.post('/api/buy', validateSession, async (req, res) => {
@@ -666,18 +800,6 @@ app.post('/api/sell', validateSession, async (req, res) => {
     }
 });
 
-app.get('/api/stock/:symbol', async (req, res) => {
-    const { symbol } = req.params;
-    const { range = '1d', interval = '5m' } = req.query;
-    
-    try {
-        const data = await fetchStockChart(symbol.toUpperCase(), range, interval);
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
 app.get('/api/stock/news', async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase().trim();
 
@@ -706,9 +828,20 @@ app.get('/api/news/hot', async (req, res) => {
     }
 });
 
+app.get('/api/stock/:symbol', async (req, res) => {
+    const { symbol } = req.params;
+    const { range = '1d', interval = '5m' } = req.query;
+    
+    try {
+        const data = await fetchStockChart(symbol.toUpperCase(), range, interval);
+        res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/api/leaderboard', async (req, res) => {
     const leaderboard = [];
-    
     for (const userId in users) {
         const user = users[userId];
         let totalValue = user.cash;
@@ -2990,4 +3123,4 @@ server.on('error', (err) => {
         console.error('Server error:', err);
     }
     process.exit(1);
-});
+}); //note add self test like v1
