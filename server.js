@@ -2,11 +2,13 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const Parser = require('rss-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-const SESSION_DURATION = 30 * 24 * 60 * 60 * 1000;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-change-this';
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -21,9 +23,14 @@ if (!fs.existsSync(DATA_DIR)) {
 
 let users = {};
 let transactions = [];
-const activeSessions = new Map();
 const requestCounts = new Map();
 const suspiciousActivity = new Map();
+const newsParser = new Parser({
+    timeout: 10000,
+    customFields: {
+        item: ['media:content', 'media:thumbnail']
+    }
+}); // fixed it 
 //non hard coded tutorial lessons so you can add more later here if you fork the repository just make sure it follows the same format
 const TUTORIAL_LESSONS = [ 
     {
@@ -126,11 +133,7 @@ const saveTransactions = () => {
 
 loadData();
 
-const generateSessionToken = () => {
-    return crypto.randomBytes(32).toString('hex');
-};
-
-const hashPassword = (password) => {
+const legacyHashPassword = (password) => {
     return crypto.createHash('sha256').update(password).digest('hex');
 };
 
@@ -156,38 +159,24 @@ const rateLimit = (req, res, next) => {
 
 const validateSession = (req, res, next) => {
     const token = req.headers['x-session-token'];
-
+    
     if (!token) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
-
-    // Check in-memory active sessions first
-    let session = activeSessions.get(token);
-
-    if (session) {
-        // session expiry handled via expires if present, and short inactivity expiry (1 hour)
-        const now = Date.now();
-        if ((session.expires && now > session.expires) || (now - session.lastActivity > 3600000)) {
-            activeSessions.delete(token);
-            session = null;
-        } else {
-            session.lastActivity = now;
-            req.userId = session.userId;
-            return next();
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.userId = decoded.userId;
+        
+        // Optional: Check if user exists (handles deleted users)
+        if (!users[req.userId]) {
+            return res.status(401).json({ error: 'User invalid' });
         }
+        
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Session expired or invalid' });
     }
-
-    // Fallback: look for persistent token in stored users
-    const userWithToken = Object.values(users).find(u => Array.isArray(u.persistentSessions) && u.persistentSessions.some(s => s.token === token && s.expires > Date.now()));
-    if (userWithToken) {
-        // restore into activeSessions for quicker checks
-        const sess = userWithToken.persistentSessions.find(s => s.token === token);
-        activeSessions.set(token, { userId: userWithToken.userId, lastActivity: Date.now(), expires: sess.expires });
-        req.userId = userWithToken.userId;
-        return next();
-    }
-
-    return res.status(401).json({ error: 'Session expired or invalid' });
 };
 
 const logSuspiciousActivity = (identifier, type, details) => {
@@ -258,27 +247,81 @@ const fetchStockChart = async (symbol, range = '1d', interval = '5m') => {
         const response = await fetch(url, {
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
-        
+
         if (!response.ok) {
             throw new Error('Failed to fetch chart data');
         }
         
         const data = await response.json();
         const result = data.chart?.result?.[0];
-        
+
+        if (!result) {
+            throw new Error('Chart data missing');
+        }
+
+        const quote = result.indicators?.quote?.[0] || {};
+        const timestamps = result.timestamp || [];
+        const opens = quote.open || [];
+        const highs = quote.high || [];
+        const lows = quote.low || [];
+        const closes = quote.close || [];
+        const candlestick = [];
+
+        for (let i = 0; i < timestamps.length; i++) {
+            const o = opens[i];
+            const h = highs[i];
+            const l = lows[i];
+            const c = closes[i];
+
+            if ([o, h, l, c].some(value => typeof value !== 'number')) {
+                continue;
+            }
+
+            candlestick.push({
+                x: timestamps[i] * 1000,
+                o,
+                h,
+                l,
+                c
+            });
+        }
+
+        const lastClose = candlestick.length ? candlestick[candlestick.length - 1].c : closes[closes.length - 1];
+
         return {
-            timestamps: result.timestamp,
-            prices: result.indicators?.quote?.[0]?.close || [],
-            currentPrice: result.meta?.regularMarketPrice
+            timestamps,
+            prices: closes,
+            candlestick,
+            currentPrice: result.meta?.regularMarketPrice || lastClose
         };
     } catch (error) {
         throw new Error(`Error fetching chart: ${error.message}`);
     }
 };
 
+const extractNewsImage = (item) => {
+    if (item?.enclosure?.url) return item.enclosure.url;
+    const mediaContent = item?.['media:content'];
+    if (mediaContent?.$?.url) return mediaContent.$.url;
+    const mediaThumb = item?.['media:thumbnail'];
+    if (mediaThumb?.$?.url) return mediaThumb.$.url;
+    return null;
+};
+
+const fetchNewsFeed = async (url) => {
+    const feed = await newsParser.parseURL(url);
+    return (feed.items || []).map(item => ({
+        title: item.title || 'Untitled',
+        url: item.link || item.guid || '',
+        source: item.source?.title || feed.title || 'News',
+        publishedAt: item.pubDate || item.isoDate || null,
+        imageUrl: extractNewsImage(item)
+    }));
+};
+
 app.use(rateLimit);
 
-app.post('/api/register', (req, res) => {
+app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     
     if (!username || !password) {
@@ -300,27 +343,24 @@ app.post('/api/register', (req, res) => {
         return res.status(409).json({ error: 'Username already exists' });
     }
     
+    const hashedPassword = await bcrypt.hash(password, 10);
+
     users[userId] = {
         userId,
         username,
-        password: hashPassword(password),
+        password: hashedPassword,
         cash: 0,
         portfolio: {},
         tutorialStep: 0,
         tutorialCompleted: false,
         uiTutorialCompleted: false,
-        persistentSessions: [],
         createdAt: Date.now(),
         lastActivity: Date.now()
     };
     
     saveUsers();
     
-    const token = generateSessionToken();
-    activeSessions.set(token, { userId, lastActivity: Date.now(), expires: Date.now() + SESSION_DURATION });
-    // persist token so users stay logged in across restarts
-    users[userId].persistentSessions = users[userId].persistentSessions || [];
-    users[userId].persistentSessions.push({ token, expires: Date.now() + SESSION_DURATION });
+    const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
     
     res.json({ 
         token, 
@@ -329,12 +369,11 @@ app.post('/api/register', (req, res) => {
         cash: users[userId].cash,
         tutorialStep: 0,
         tutorialCompleted: false,
-        uiTutorialCompleted: false,
-        sessionExpires: Date.now() + SESSION_DURATION
+        uiTutorialCompleted: false
     });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     
     if (!username || !password) {
@@ -346,21 +385,40 @@ app.post('/api/login', (req, res) => {
         u.username.toLowerCase() === normalizedUsername
     );
     
-    if (!user || user.password !== hashPassword(password)) {
+    if (!user) {
         logSuspiciousActivity(req.ip, 'FAILED_LOGIN', username);
         return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    const token = generateSessionToken();
-    activeSessions.set(token, { userId: user.userId, lastActivity: Date.now(), expires: Date.now() + SESSION_DURATION });
+    // Check password (support both bcrypt and legacy sha256)
+    let isValid = false;
+    let needsRehash = false;
 
-    // store persistent session on user so token survives server restart
-    user.persistentSessions = user.persistentSessions || [];
-    user.persistentSessions.push({ token, expires: Date.now() + SESSION_DURATION });
+    if (user.password && user.password.startsWith('$2')) {
+        isValid = await bcrypt.compare(password, user.password);
+    } else {
+        if (user.password === legacyHashPassword(password)) {
+            isValid = true;
+            needsRehash = true;
+        }
+    }
+    
+    if (!isValid) {
+        logSuspiciousActivity(req.ip, 'FAILED_LOGIN', username);
+        return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
+    // Migrate to bcrypt if needed
+    if (needsRehash) {
+        user.password = await bcrypt.hash(password, 10);
+        saveUsers();
+    }
+    
+    const token = jwt.sign({ userId: user.userId }, JWT_SECRET, { expiresIn: '7d' });
+    
     user.lastActivity = Date.now();
     saveUsers();
-
+    
     res.json({ 
         token,
         userId: user.userId,
@@ -369,8 +427,7 @@ app.post('/api/login', (req, res) => {
         portfolio: user.portfolio,
         tutorialStep: user.tutorialStep || 0,
         tutorialCompleted: user.tutorialCompleted || false,
-        uiTutorialCompleted: user.uiTutorialCompleted || false,
-        sessionExpires: Date.now() + SESSION_DURATION
+        uiTutorialCompleted: user.uiTutorialCompleted || false
     });
 });
 
@@ -388,29 +445,6 @@ app.get('/api/portfolio', validateSession, (req, res) => {
         tutorialCompleted: user.tutorialCompleted || false,
         uiTutorialCompleted: user.uiTutorialCompleted || false
     });
-});
-
-// Logout endpoint: remove session token both in-memory and from user's persistent sessions
-app.post('/api/logout', (req, res) => {
-    const token = req.headers['x-session-token'];
-    if (!token) return res.status(400).json({ error: 'No token provided' });
-
-    activeSessions.delete(token);
-
-    // remove from any user's persistentSessions
-    for (const userId in users) {
-        const user = users[userId];
-        if (Array.isArray(user.persistentSessions)) {
-            const idx = user.persistentSessions.findIndex(s => s.token === token);
-            if (idx !== -1) {
-                user.persistentSessions.splice(idx, 1);
-                saveUsers();
-                break;
-            }
-        }
-    }
-
-    res.json({ success: true });
 });
 
 app.get('/api/tutorial/current', validateSession, (req, res) => {
@@ -630,6 +664,34 @@ app.get('/api/stock/:symbol', async (req, res) => {
     }
 });
 
+app.get('/api/stock/news', async (req, res) => {
+    const symbol = (req.query.symbol || '').toUpperCase().trim();
+
+    if (!symbol) {
+        return res.status(400).json({ error: 'Symbol query parameter required' });
+    }
+
+    try {
+        const query = encodeURIComponent(`${symbol} stock`);
+        const rssUrl = `https://news.google.com/rss/search?q=${query}&hl=en-US&gl=US&ceid=US:en`;
+        const items = await fetchNewsFeed(rssUrl);
+        res.json(items.slice(0, 12));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/news/hot', async (req, res) => {
+    try {
+        const query = encodeURIComponent('stock market OR market news OR trading');
+        const rssUrl = `https://news.google.com/rss/search?q=${query}&hl=en-US&gl=US&ceid=US:en`;
+        const items = await fetchNewsFeed(rssUrl);
+        res.json(items.slice(0, 12));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/api/leaderboard', async (req, res) => {
     const leaderboard = [];
     
@@ -659,7 +721,7 @@ app.get('/api/leaderboard', async (req, res) => {
     res.json(leaderboard.slice(0, 100));
 });
 
-app.get('/api/transactions', validateSession, (req, res) => {
+app.get('/api/transactions', validateSession, (req, res) => { //will make all server side transactions to be safe since server overrides client data
     const userId = req.userId;
     const userTransactions = transactions
         .filter(t => t.userId === userId)
@@ -1095,12 +1157,37 @@ app.get('/', (req, res) => {
             border-color: #6bbf33;
         }
 
+        .chart-grid {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+            overflow-x: auto;
+            padding-bottom: 8px;
+            scroll-snap-type: x mandatory;
+        }
+
+        .chart-grid::-webkit-scrollbar {
+            height: 8px;
+        }
+
+        .chart-grid::-webkit-scrollbar-thumb {
+            background: #3a3a3c;
+            border-radius: 10px;
+        }
+
+        .chart-grid::-webkit-scrollbar-track {
+            background: #1c1c1e;
+        }
+
         .chart-container {
-            height: 400px;
+            flex: 0 0 540px;
+            min-width: 520px;
+            max-width: 640px;
+            height: 360px;
             background: #0a0a0a;
             border-radius: 8px;
             padding: 16px;
-            margin-bottom: 16px;
+            scroll-snap-align: start;
         }
 
         .time-range-selector {
@@ -1280,6 +1367,81 @@ app.get('/', (req, res) => {
             margin-bottom: 12px;
         }
 
+        .news-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }
+
+        .news-card {
+            background: #151517;
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        .news-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-height: 360px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .news-item {
+            display: flex;
+            gap: 12px;
+            text-decoration: none;
+            color: #fff;
+            background: #2c2c2e;
+            padding: 12px;
+            border-radius: 8px;
+            transition: background 0.2s ease;
+        }
+
+        .news-item:hover {
+            background: #3a3a3c;
+        }
+
+        .news-thumb {
+            width: 64px;
+            height: 64px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #0a0a0a;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .news-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .news-placeholder {
+            font-size: 10px;
+            color: #777;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .news-title {
+            font-size: 14px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+
+        .news-meta {
+            font-size: 12px;
+            color: #999;
+            margin-top: 6px;
+        }
+
         .transaction-type {
             font-weight: 700;
             padding: 4px 8px;
@@ -1321,6 +1483,20 @@ app.get('/', (req, res) => {
 
             .content-right {
                 width: 100%;
+            }
+
+            .chart-grid {
+                flex-wrap: nowrap;
+            }
+
+            .chart-container {
+                flex: 0 0 90vw;
+                min-width: 90vw;
+                max-width: 90vw;
+            }
+
+            .news-grid {
+                grid-template-columns: 1fr;
             }
         }
 
@@ -1697,6 +1873,8 @@ app.get('/', (req, res) => {
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script> 
     <script>
         let sessionToken = null;
         let currentUsername = null;
@@ -1704,6 +1882,7 @@ app.get('/', (req, res) => {
         let currentPortfolio = {};
         let currentSymbol = null;
         let chartInstance = null;
+        let lineChartInstance = null;
         let currentRange = '1d';
 
         document.addEventListener('DOMContentLoaded', initApp);
@@ -2153,7 +2332,8 @@ app.get('/', (req, res) => {
             container.innerHTML = '<div class="loading">Loading...</div>';
 
             try {
-                const response = await fetch(\`/api/stock/\${symbol}?range=\${currentRange}&interval=\${getInterval()}\`);
+                const { range: rangeParam, interval: intervalParam } = getRangeSettings(currentRange);
+                const response = await fetch(\`/api/stock/\${symbol}?range=\${rangeParam}&interval=\${intervalParam}\`);
                 
                 if (!response.ok) {
                     throw new Error('Stock not found');
@@ -2171,24 +2351,26 @@ app.get('/', (req, res) => {
             }
         }
 
-        function getInterval() {
-            const intervals = {
-                '1d': '5m',
-                '1w': '30m',
-                '1m': '1d',
-                '3m': '1d',
-                '1y': '1wk',
-                '5y': '1mo'
+        function getRangeSettings(rangeKey) {
+            const settings = {
+                '1d': { range: '1d', interval: '5m' },
+                '1w': { range: '5d', interval: '30m' },
+                '1m': { range: '1mo', interval: '1h' },
+                '3m': { range: '3mo', interval: '1d' },
+                '1y': { range: '1y', interval: '1wk' },
+                '5y': { range: '5y', interval: '1mo' }
             };
-            return intervals[currentRange] || '1d';
+            return settings[rangeKey] || settings['1d'];
         }
 
         function renderStockView(symbol, data) {
-            const currentPrice = data.currentPrice;
-            const prices = data.prices.filter(p => p !== null);
-            const firstPrice = prices[0];
+            const candles = data.candlestick || []; //array of {t, o, h, l, c}
+            const firstPrice = candles.length ? candles[0].o : (data.prices?.[0] ?? data.currentPrice ?? 0);
+            const lastPrice = candles.length ? candles[candles.length - 1].c : (data.prices?.[data.prices.length - 1] ?? data.currentPrice ?? 0);
+            const currentPrice = data.currentPrice ?? lastPrice;
             const priceChange = currentPrice - firstPrice;
-            const percentChange = ((priceChange / firstPrice) * 100).toFixed(2);
+            const percentChangeValue = firstPrice > 0 ? (priceChange / firstPrice) * 100 : 0;
+            const percentChange = percentChangeValue.toFixed(2);
             const changeClass = priceChange >= 0 ? 'positive' : 'negative';
 
             const holding = currentPortfolio[symbol];
@@ -2213,8 +2395,13 @@ app.get('/', (req, res) => {
                     <button class="time-btn \${currentRange === '5y' ? 'active' : ''}" onclick="changeRange('5y')">5Y</button>
                 </div>
 
-                <div class="chart-container">
-                    <canvas id="stockChart"></canvas>
+                <div class="chart-grid">
+                    <div class="chart-container">
+                        <canvas id="stockChart"></canvas>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="lineChart"></canvas>
+                    </div>
                 </div>
 
                 <div class="trade-panel">
@@ -2224,42 +2411,106 @@ app.get('/', (req, res) => {
                 </div>
 
                 \${ownedShares > 0 ? \`<div style="text-align: center; color: #999; font-size: 14px;">You own \${ownedShares} shares</div>\` : ''}
+
+                <div class="news-grid">
+                    <div class="news-card">
+                        <div class="card-header">
+                            <h3 class="card-title">News for \${symbol}</h3>
+                        </div>
+                        <div id="symbolNewsList" class="news-list">
+                            <div class="loading">Loading news...</div>
+                        </div>
+                    </div>
+                    <div class="news-card">
+                        <div class="card-header">
+                            <h3 class="card-title">Hottest News</h3>
+                        </div>
+                        <div id="hotNewsList" class="news-list">
+                            <div class="loading">Loading news...</div>
+                        </div>
+                    </div>
+                </div>
             \`;
 
             renderChart(data);
+            loadNews(symbol);
         }
 
         function renderChart(data) {
             const ctx = document.getElementById('stockChart').getContext('2d');
-            
+            const lineCtx = document.getElementById('lineChart').getContext('2d');
+
             if (chartInstance) {
                 chartInstance.destroy();
             }
+            if (lineChartInstance) {
+                lineChartInstance.destroy();
+            }
 
-            const labels = data.timestamps.map(ts => {
-                const date = new Date(ts * 1000);
-                if (currentRange === '1d') {
-                    return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+            const candles = data.candlestick || [];
+            const lineSeries = candles.map(point => ({ x: point.x, y: point.c }));
+            const colorUp = '#6ede23';
+            const colorDown = '#fc352b';
+            const colorUnchanged = '#bfbfbf';
+            const label = (currentSymbol || 'Stock') + ' Candlestick';
+            const lineLabel = (currentSymbol || 'Stock') + ' Price';
+
+            const crosshairPlugin = {
+                id: 'crosshair',
+                afterEvent: (chart, args) => {
+                    const event = args.event;
+                    if (!event || !chart.chartArea) {
+                        chart.$crosshair = null;
+                        return;
+                    }
+
+                    const { left, right, top, bottom } = chart.chartArea;
+                    const x = event.x;
+                    const y = event.y;
+                    const inside = x >= left && x <= right && y >= top && y <= bottom;
+
+                    chart.$crosshair = inside ? { x, y } : null;
+                },
+                afterDraw: (chart) => {
+                    const crosshair = chart.$crosshair;
+                    if (!crosshair || !chart.chartArea) return;
+
+                    const ctx = chart.ctx;
+                    const { left, right, top, bottom } = chart.chartArea;
+                    const { x, y } = crosshair;
+
+                    ctx.save();
+                    ctx.setLineDash([4, 4]);
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = '#4a4a4c';
+
+                    ctx.beginPath();
+                    ctx.moveTo(x, top);
+                    ctx.lineTo(x, bottom);
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(left, y);
+                    ctx.lineTo(right, y);
+                    ctx.stroke();
+
+                    ctx.restore();
                 }
-                return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-            });
-
-            const prices = data.prices.filter(p => p !== null);
-            const color = prices[prices.length - 1] >= prices[0] ? '#6bbf33' : '#ff453a';
+            };
 
             chartInstance = new Chart(ctx, {
-                type: 'line',
+                type: 'candlestick',
                 data: {
-                    labels: labels,
                     datasets: [{
-                        data: data.prices,
-                        borderColor: color,
-                        backgroundColor: color + '20',
-                        borderWidth: 2,
-                        fill: true,
-                        tension: 0.1,
-                        pointRadius: 0,
-                        pointHoverRadius: 4
+                        label,
+                        data: candles,
+                        barPercentage: 1,
+                        borderColor: '#fff0',
+                        color: {
+                            up: colorUp,
+                            down: colorDown,
+                            unchanged: colorUnchanged
+                        }
                     }]
                 },
                 options: {
@@ -2268,21 +2519,27 @@ app.get('/', (req, res) => {
                     plugins: {
                         legend: { display: false },
                         tooltip: {
-                            mode: 'index',
-                            intersect: false,
+                            position: 'nearest',
                             backgroundColor: '#2c2c2e',
                             titleColor: '#fff',
                             bodyColor: '#fff',
                             borderColor: '#3a3a3c',
                             borderWidth: 1,
                             callbacks: {
-                                label: (context) => formatCurrency(context.parsed.y)
+                                label: (context) => {
+                                    const { o, h, l, c } = context.raw || {};
+                                    return 'O ' + formatCurrency(o) + '  H ' + formatCurrency(h) + '  L ' + formatCurrency(l) + '  C ' + formatCurrency(c);
+                                }
                             }
                         }
                     },
                     scales: {
                         x: {
-                            display: true,
+                            type: 'time',
+                            time: {
+                                tooltipFormat: 'PPpp',
+                                unit: currentRange === '1d' ? 'hour' : 'day'
+                            },
                             grid: { color: '#2c2c2e' },
                             ticks: { color: '#999', maxTicksLimit: 8 }
                         },
@@ -2300,8 +2557,143 @@ app.get('/', (req, res) => {
                         mode: 'index',
                         intersect: false
                     }
-                }
+                },
+                plugins: [crosshairPlugin]
             });
+
+            lineChartInstance = new Chart(lineCtx, {
+                type: 'line',
+                data: {
+                    datasets: [{
+                        label: lineLabel,
+                        data: lineSeries,
+                        borderColor: '#6bbf33',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        tension: 0.15,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            position: 'nearest',
+                            backgroundColor: '#2c2c2e',
+                            titleColor: '#fff',
+                            bodyColor: '#fff',
+                            borderColor: '#3a3a3c',
+                            borderWidth: 1,
+                            callbacks: {
+                                label: (context) => formatCurrency(context.parsed?.y)
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                tooltipFormat: 'PPpp',
+                                unit: currentRange === '1d' ? 'hour' : 'day'
+                            },
+                            grid: { color: '#2c2c2e' },
+                            ticks: { color: '#999', maxTicksLimit: 8 }
+                        },
+                        y: {
+                            display: true,
+                            position: 'right',
+                            grid: { color: '#2c2c2e' },
+                            ticks: {
+                                color: '#999',
+                                callback: (value) => formatCurrency(value)
+                            }
+                        }
+                    },
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    }
+                },
+                plugins: [crosshairPlugin]
+            });
+        }
+
+        function formatNewsDate(value) {
+            if (!value) return '';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return '';
+            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        }
+
+        function renderNewsList(items, container) {
+            if (!container) return;
+
+            if (!Array.isArray(items) || items.length === 0) {
+                container.innerHTML = '<div class="empty-state"><p>No news found.</p></div>';
+                return;
+            }
+
+            const html = items.map((item) => {
+                const title = item.title || 'Untitled';
+                const url = item.url || '#';
+                const source = item.source || 'News';
+                const dateLabel = formatNewsDate(item.publishedAt);
+                const meta = dateLabel ? source + ' • ' + dateLabel : source;
+                const imageHtml = item.imageUrl
+                    ? '<img src="' + item.imageUrl + '" alt="">'
+                    : '<div class="news-placeholder">News</div>';
+
+                return '<a class="news-item" href="' + url + '" target="_blank" rel="noopener">'
+                    + '<div class="news-thumb">' + imageHtml + '</div>'
+                    + '<div class="news-content">'
+                    + '<div class="news-title">' + title + '</div>'
+                    + '<div class="news-meta">' + meta + '</div>'
+                    + '</div>'
+                    + '</a>';
+            }).join('');
+
+            container.innerHTML = html;
+        }
+
+        async function loadSymbolNews(symbol) {
+            const container = document.getElementById('symbolNewsList');
+            if (!container) return;
+            container.innerHTML = '<div class="loading">Loading news...</div>';
+
+            try {
+                const response = await fetch('/api/stock/news?symbol=' + encodeURIComponent(symbol));
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load news');
+                }
+                renderNewsList(data, container);
+            } catch (error) {
+                container.innerHTML = '<div class="empty-state"><p>' + error.message + '</p></div>';
+            }
+        }
+
+        async function loadHotNews() {
+            const container = document.getElementById('hotNewsList');
+            if (!container) return;
+            container.innerHTML = '<div class="loading">Loading news...</div>';
+
+            try {
+                const response = await fetch('/api/news/hot');
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load news');
+                }
+                renderNewsList(data, container);
+            } catch (error) {
+                container.innerHTML = '<div class="empty-state"><p>' + error.message + '</p></div>';
+            }
+        }
+
+        function loadNews(symbol) {
+            loadSymbolNews(symbol);
+            loadHotNews();
         }
 
         async function changeRange(range) {
