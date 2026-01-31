@@ -1,0 +1,9 @@
+{
+  "test": {
+    "username": "test",
+    "password": "test",
+    "balance": 10000,
+    "portfolio": {},
+    "createdAt": "2026-01-28T23:13:09.517Z"
+  }
+}

@@ -98,6 +98,20 @@ const TUTORIAL_LESSONS = [
         ],
         correctAnswer: 1
     }
+    ,
+    {
+        id: 'dividends-yield',
+        title: 'Dividends and Yield',
+        content: 'Some companies distribute part of their profits to shareholders as dividends. Dividend yield expresses the dividend as a percentage of the stock price and can be a source of income for investors.',
+        question: 'What does dividend yield represent?',
+        options: [
+            'The annual dividend divided by the stock price',
+            'The percentage gain of a stock in a day',
+            'The company\'s total profit margin',
+            'The broker\'s commission rate'
+        ],
+        correctAnswer: 0
+    }
 ];
 
 const loadData = () => {
