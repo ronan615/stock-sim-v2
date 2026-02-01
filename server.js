@@ -35,11 +35,44 @@ const ensureUserDefaults = (user) => {
     if (!user) return;
     if (!Array.isArray(user.challengesClaimed)) user.challengesClaimed = [];
     if (!Array.isArray(user.unlockedFeatures)) user.unlockedFeatures = [];
+    if (!Array.isArray(user.watchlist)) user.watchlist = [];
+    if (typeof user.lastDailyBonusAt !== 'number' && user.lastDailyBonusAt !== null) {
+        user.lastDailyBonusAt = null;
+    }
+};
+const DAILY_BONUS_AMOUNT = 500;
+const normalizeSymbol = (symbol) => {
+    if (!symbol) return null;
+    const trimmed = symbol.toUpperCase().trim();
+    if (!/^[A-Z\.]{1,10}$/.test(trimmed)) return null;
+    return trimmed;
+};
+
+const getDailyBonusStatus = (user) => {
+    ensureUserDefaults(user);
+    const now = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const lastClaim = user.lastDailyBonusAt;
+    const eligible = !lastClaim || lastClaim < startOfToday.getTime();
+
+    const nextAvailableAt = eligible
+        ? startOfToday.getTime()
+        : startOfToday.getTime() + 24 * 60 * 60 * 1000;
+
+    return {
+        eligible,
+        lastClaim,
+        nextAvailableAt,
+        amount: DAILY_BONUS_AMOUNT
+    };
 };
 //non hard coded tutorial lessons so you can add more later here if you fork the repository just make sure it follows the same format
 const TUTORIAL_LESSONS = [ 
     {
         id: 'stocks-basics',
+        element: '#symbolSearch',
         title: 'Understanding Stocks',
         content: 'A stock represents partial ownership in a company. When you buy a share of stock, you become a shareholder and own a piece of that business. Stock prices fluctuate based on company performance, market conditions, and investor sentiment.',
         question: 'What does owning a stock represent?',
@@ -53,6 +86,7 @@ const TUTORIAL_LESSONS = [
     },
     {
         id: 'supply-demand',
+        element: '#stockContent',
         title: 'Supply and Demand',
         content: 'Stock prices are determined by supply and demand. When more people want to buy a stock (high demand) than sell it (low supply), the price goes up. When more people want to sell than buy, the price falls. This is the fundamental principle of market pricing.',
         question: 'What happens to a stock price when demand significantly exceeds supply?',
@@ -66,6 +100,7 @@ const TUTORIAL_LESSONS = [
     },
     {
         id: 'risk-reward',
+        element: '#cashDisplay',
         title: 'Risk and Reward',
         content: 'All investments carry risk. Generally, higher potential returns come with higher risk. Understanding your risk tolerance is crucial before investing. Diversification—spreading investments across different assets—can help manage risk.',
         question: 'What is the relationship between risk and potential reward in investing?',
@@ -79,6 +114,7 @@ const TUTORIAL_LESSONS = [
     },
     {
         id: 'market-orders',
+        element: '.trade-btn.buy',
         title: 'Market Orders',
         content: 'A market order is an instruction to buy or sell a stock immediately at the current market price. It prioritizes speed over price. Market orders are executed quickly but the final price may differ slightly from what you saw when placing the order.',
         question: 'What is the main advantage of a market order?',
@@ -92,6 +128,7 @@ const TUTORIAL_LESSONS = [
     },
     {
         id: 'portfolio-diversification',
+        element: '#portfolioList',
         title: 'Building a Portfolio',
         content: 'A portfolio is your collection of investments. Diversification means not putting all your eggs in one basket—spreading investments across different companies, sectors, and asset types reduces risk. If one investment performs poorly, others may balance it out.',
         question: 'Why is portfolio diversification important?',
@@ -102,10 +139,10 @@ const TUTORIAL_LESSONS = [
             'To guarantee profits'
         ],
         correctAnswer: 1
-    }
-    ,
+    },
     {
         id: 'dividends-yield',
+        element: '#portfolioValue',
         title: 'Dividends and Yield',
         content: 'Some companies distribute part of their profits to shareholders as dividends. Dividend yield expresses the dividend as a percentage of the stock price and can be a source of income for investors.',
         question: 'What does dividend yield represent?',
@@ -462,7 +499,9 @@ app.post('/api/register', async (req, res) => {
         tutorialCompleted: false,
         uiTutorialCompleted: false,
         challengesClaimed: [],
-        unlockedFeatures: []
+        unlockedFeatures: [],
+        watchlist: [],
+        lastDailyBonusAt: null
     });
 });
 
@@ -524,7 +563,9 @@ app.post('/api/login', async (req, res) => {
         tutorialCompleted: user.tutorialCompleted || false,
         uiTutorialCompleted: user.uiTutorialCompleted || false,
         challengesClaimed: user.challengesClaimed,
-        unlockedFeatures: user.unlockedFeatures
+        unlockedFeatures: user.unlockedFeatures,
+        watchlist: user.watchlist || [],
+        dailyBonus: getDailyBonusStatus(user)
     });
 });
 
@@ -540,7 +581,9 @@ app.get('/api/portfolio', validateSession, (req, res) => {
         username: user.username,
         tutorialStep: user.tutorialStep || 0,
         tutorialCompleted: user.tutorialCompleted || false,
-        uiTutorialCompleted: user.uiTutorialCompleted || false
+        uiTutorialCompleted: user.uiTutorialCompleted || false,
+        watchlist: user.watchlist || [],
+        dailyBonus: getDailyBonusStatus(user)
     });
 });
 
@@ -566,13 +609,16 @@ app.get('/api/tutorial/current', validateSession, (req, res) => {
         total: TUTORIAL_LESSONS.length,
         lesson: {
             id: lesson.id,
+            element: lesson.element || null,
             title: lesson.title,
             content: lesson.content,
             question: lesson.question,
             options: lesson.options
         },
         tutorialCompleted: user.tutorialCompleted || false,
-        uiTutorialCompleted: user.uiTutorialCompleted || false
+        uiTutorialCompleted: user.uiTutorialCompleted || false,
+        watchlist: user.watchlist || [],
+        dailyBonus: getDailyBonusStatus(user)
     });
 });
 
@@ -644,7 +690,7 @@ app.get('/api/challenges', validateSession, (req, res) => {
 
     ensureUserDefaults(user);
     const challenges = getChallengeStatuses(req.userId);
-    res.json({ challenges, cash: user.cash });
+    res.json({ challenges, cash: user.cash, dailyBonus: getDailyBonusStatus(user), watchlist: user.watchlist || [] });
 });
 
 app.post('/api/challenges/:id/claim', validateSession, (req, res) => {
@@ -683,6 +729,113 @@ app.post('/api/challenges/:id/claim', validateSession, (req, res) => {
         reward: challenge.reward,
         cash: user.cash,
         challenges
+    });
+});
+
+app.get('/api/watchlist', validateSession, async (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const symbols = user.watchlist || [];
+
+    const watchlist = await Promise.all(symbols.map(async (symbol) => {
+        try {
+            const price = await fetchStockPrice(symbol);
+            return { symbol, price };
+        } catch (error) {
+            return { symbol, price: null };
+        }
+    }));
+
+    res.json({ watchlist });
+});
+
+app.post('/api/watchlist', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const normalized = normalizeSymbol(req.body.symbol);
+
+    if (!normalized) {
+        return res.status(400).json({ error: 'Invalid symbol' });
+    }
+
+    if (user.watchlist.includes(normalized)) {
+        return res.json({ watchlist: user.watchlist });
+    }
+
+    if (user.watchlist.length >= 50) {
+        return res.status(400).json({ error: 'Watchlist limit reached (50)' });
+    }
+
+    user.watchlist.push(normalized);
+    saveUsers();
+
+    res.json({ watchlist: user.watchlist });
+});
+
+app.delete('/api/watchlist/:symbol', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const normalized = normalizeSymbol(req.params.symbol);
+
+    if (!normalized) {
+        return res.status(400).json({ error: 'Invalid symbol' });
+    }
+
+    user.watchlist = (user.watchlist || []).filter(sym => sym !== normalized);
+    saveUsers();
+
+    res.json({ watchlist: user.watchlist });
+});
+
+app.get('/api/daily-bonus', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const status = getDailyBonusStatus(user);
+    res.json({ dailyBonus: status, cash: user.cash });
+});
+
+app.post('/api/daily-bonus/claim', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const status = getDailyBonusStatus(user);
+
+    if (!status.eligible) {
+        return res.status(429).json({
+            error: 'Daily bonus already claimed',
+            dailyBonus: status
+        });
+    }
+
+    user.cash += DAILY_BONUS_AMOUNT;
+    user.lastDailyBonusAt = Date.now();
+    saveUsers();
+
+    const nextStatus = getDailyBonusStatus(user);
+
+    res.json({
+        success: true,
+        cash: user.cash,
+        dailyBonus: nextStatus
     });
 });
 
@@ -1270,6 +1423,145 @@ app.get('/', (req, res) => {
             border-radius: 12px;
             padding: 24px;
             margin-bottom: 24px;
+        }
+
+        .overview-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+
+        .mini-stat {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .mini-label {
+            font-size: 13px;
+            color: #9aa0a6;
+        }
+
+        .mini-value {
+            font-size: 24px;
+            font-weight: 700;
+        }
+
+        .pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #000;
+            background: #6bbf33;
+        }
+
+        .bonus-card .card-header {
+            margin-bottom: 12px;
+        }
+
+        .bonus-meta {
+            font-size: 13px;
+            color: #9aa0a6;
+            margin-top: 8px;
+        }
+
+        .bonus-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .bonus-btn {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 700;
+            cursor: pointer;
+            background: #6bbf33;
+            color: #000;
+            transition: background 0.2s ease;
+        }
+
+        .bonus-btn:disabled {
+            background: #2c2c2e;
+            color: #888;
+            cursor: not-allowed;
+        }
+
+        .watchlist-header {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .watchlist-input {
+            flex: 1;
+            padding: 12px;
+            background: #2c2c2e;
+            border: 1px solid #3a3a3c;
+            border-radius: 8px;
+            color: #fff;
+        }
+
+        .watchlist-add-btn {
+            padding: 12px 14px;
+            background: #6bbf33;
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .watchlist-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .watchlist-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px;
+            background: #2c2c2e;
+            border-radius: 10px;
+        }
+
+        .watchlist-symbol {
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .watchlist-price {
+            font-size: 14px;
+            color: #9aa0a6;
+            margin-left: 6px;
+        }
+
+        .watchlist-remove {
+            border: none;
+            background: #3a3a3c;
+            color: #fff;
+            padding: 8px 10px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .quick-stats-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 12px;
+        }
+
+        .quick-stat {
+            padding: 12px;
+            background: #2c2c2e;
+            border-radius: 10px;
         }
 
         .card-header {
@@ -1957,6 +2249,41 @@ app.get('/', (req, res) => {
         <div class="main-content">
             <div class="content-left">
                 <div id="tradingTab" class="tab-content">
+                    <div class="overview-grid">
+                        <div class="card bonus-card">
+                            <div class="card-header">
+                                <h3 class="card-title">Daily Bonus</h3>
+                                <span class="pill" id="dailyBonusAmountLabel">$500</span>
+                            </div>
+                            <div class="mini-stat">
+                                <span class="mini-label">Status</span>
+                                <span class="mini-value" id="dailyBonusStatus">Checking…</span>
+                            </div>
+                            <div class="bonus-meta" id="dailyBonusNext"></div>
+                            <div class="bonus-actions">
+                                <button class="bonus-btn" id="dailyBonusBtn" onclick="claimDailyBonus()">Claim now</button>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header">
+                                <h3 class="card-title">Watchlist</h3>
+                            </div>
+                            <div class="watchlist-header">
+                                <input id="watchlistInput" class="watchlist-input" placeholder="Add symbol (e.g., AAPL)">
+                                <button class="watchlist-add-btn" onclick="addWatchlistSymbol()">Add</button>
+                            </div>
+                            <div id="watchlistList" class="watchlist-list"></div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header">
+                                <h3 class="card-title">Quick Stats</h3>
+                            </div>
+                            <div class="quick-stats-list" id="quickStats"></div>
+                        </div>
+                    </div>
+
                     <div class="search-box">
                         <input type="text" class="search-input" id="symbolSearch" placeholder="Search stocks (e.g., AAPL, TSLA, GOOGL)" onkeypress="if(event.key==='Enter') loadStock()">
                     </div>
@@ -2023,6 +2350,7 @@ app.get('/', (req, res) => {
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script> 
     <script>
+        const DAILY_BONUS_AMOUNT = 500;
         let sessionToken = null;
         let currentUsername = null;
         let currentCash = 0;
@@ -2031,6 +2359,8 @@ app.get('/', (req, res) => {
         let chartInstance = null;
         let lineChartInstance = null;
         let currentRange = '1d';
+        let dailyBonusState = null;
+        let watchlistSymbols = [];
 
         document.addEventListener('DOMContentLoaded', initApp);
 
@@ -2056,6 +2386,8 @@ app.get('/', (req, res) => {
                 currentCash = data.cash;
                 currentPortfolio = data.portfolio;
                 currentUsername = data.username;
+                dailyBonusState = data.dailyBonus || null;
+                watchlistSymbols = data.watchlist || [];
                 document.getElementById('appContainer').style.display = 'block';
                 showApp();
             } catch (error) {
@@ -2084,6 +2416,164 @@ app.get('/', (req, res) => {
             return new Intl.NumberFormat('en-US').format(value);
         }
 
+        const formatTimeUntil = (timestamp) => {
+            if (!timestamp) return '';
+            const delta = timestamp - Date.now();
+            if (delta <= 0) return 'Now';
+            const hours = Math.floor(delta / (1000 * 60 * 60));
+            const minutes = Math.floor((delta % (1000 * 60 * 60)) / (1000 * 60));
+            return hours + 'h ' + minutes + 'm';
+        };
+
+        function renderDailyBonus(status) {
+            const statusEl = document.getElementById('dailyBonusStatus');
+            const nextEl = document.getElementById('dailyBonusNext');
+            const btn = document.getElementById('dailyBonusBtn');
+            const amountLabel = document.getElementById('dailyBonusAmountLabel');
+
+            if (!statusEl) return;
+            const effective = status || { eligible: false, amount: DAILY_BONUS_AMOUNT };
+            amountLabel.textContent = '$' + effective.amount;
+
+            if (effective.eligible) {
+                statusEl.textContent = 'Ready to claim';
+                nextEl.textContent = 'Grab your daily reward.';
+                btn.disabled = false;
+            } else {
+                statusEl.textContent = 'Already claimed';
+                nextEl.textContent = 'Next in ' + formatTimeUntil(effective.nextAvailableAt);
+                btn.disabled = true;
+            }
+        }
+
+        async function claimDailyBonus() {
+            try {
+                const response = await fetch('/api/daily-bonus/claim', {
+                    method: 'POST',
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Unable to claim bonus', 'error');
+                    renderDailyBonus(data.dailyBonus || dailyBonusState);
+                    return;
+                }
+
+                dailyBonusState = data.dailyBonus;
+                currentCash = data.cash;
+                updateHeader();
+                renderDailyBonus(dailyBonusState);
+                renderQuickStats();
+                showToast('Daily bonus claimed!', 'success');
+            } catch (error) {
+                showToast('Unable to claim bonus', 'error');
+            }
+        }
+
+        function renderWatchlist(symbols) {
+            const container = document.getElementById('watchlistList');
+            if (!container) return;
+            const list = symbols || [];
+            if (!list.length) {
+                container.innerHTML = '<div class=\\'empty-state\\'><div class=\\'empty-state-icon\\'>⭐</div><p>No symbols yet</p></div>';
+                return;
+            }
+
+            container.innerHTML = '';
+            list.forEach(item => {
+                const symbol = item.symbol || item;
+                const row = document.createElement('div');
+                row.className = 'watchlist-item';
+
+                const left = document.createElement('div');
+                const priceFragment = item.price ? '<span class=\\'watchlist-price\\'>' + formatCurrency(item.price) + '</span>' : '';
+                left.innerHTML = '<span class=\\'watchlist-symbol\\' onclick=\\'loadFromWatchlist(\\\\\\'' + symbol + '\\\\\\')\\'>' + symbol + '</span>' + priceFragment;
+
+                const removeBtn = document.createElement('button');
+                removeBtn.className = 'watchlist-remove';
+                removeBtn.textContent = 'Remove';
+                removeBtn.addEventListener('click', () => removeWatchlistSymbol(symbol));
+
+                row.appendChild(left);
+                row.appendChild(removeBtn);
+                container.appendChild(row);
+            });
+        }
+
+        async function loadWatchlist() {
+            try {
+                const response = await fetch('/api/watchlist', {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                watchlistSymbols = (data.watchlist || []).map(s => ({ symbol: s.symbol || s, price: s.price }));
+                renderWatchlist(watchlistSymbols);
+            } catch (error) {
+                // ignore for now
+            }
+        }
+
+        async function addWatchlistSymbol() {
+            const input = document.getElementById('watchlistInput');
+            const raw = (input.value || '').trim();
+            if (!raw) return;
+            try {
+                const response = await fetch('/api/watchlist', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ symbol: raw })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Could not add symbol', 'error');
+                    return;
+                }
+                watchlistSymbols = data.watchlist || [];
+                input.value = '';
+                loadWatchlist();
+            } catch (error) {
+                showToast('Could not add symbol', 'error');
+            }
+        }
+
+        async function removeWatchlistSymbol(symbol) {
+            try {
+                await fetch('/api/watchlist/' + encodeURIComponent(symbol), {
+                    method: 'DELETE',
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                watchlistSymbols = (watchlistSymbols || []).filter(s => (s.symbol || s) !== symbol);
+                renderWatchlist(watchlistSymbols);
+            } catch (error) {
+                showToast('Could not remove symbol', 'error');
+            }
+        }
+
+        function loadFromWatchlist(symbol) {
+            document.getElementById('symbolSearch').value = symbol;
+            loadStock();
+        }
+
+        function renderQuickStats() {
+            const container = document.getElementById('quickStats');
+            if (!container) return;
+            const holdings = Object.keys(currentPortfolio || {}).length;
+            const totalShares = Object.values(currentPortfolio || {}).reduce((sum, h) => sum + (h.quantity || 0), 0);
+            const stats = [
+                { label: 'Holdings', value: holdings },
+                { label: 'Shares owned', value: totalShares },
+                { label: 'Cash', value: formatCurrency(currentCash) }
+            ];
+            container.innerHTML = stats.map(s => {
+                const val = (typeof s.value === 'number' && s.label !== 'Cash') ? formatNumber(s.value) : s.value;
+                return '<div class="quick-stat"><div class="mini-label">' + s.label + '</div><div class="mini-value">' + val + '</div></div>';
+            }).join('');
+        }
+
         function logout() {
             sessionToken = null;
             currentUsername = null;
@@ -2098,6 +2588,10 @@ app.get('/', (req, res) => {
             updateHeader();
             refreshPortfolio();
             updateQuickPortfolio();
+            renderDailyBonus(dailyBonusState);
+            renderWatchlist(watchlistSymbols);
+            loadWatchlist();
+            renderQuickStats();
             checkAndShowTutorial();
         }
 
@@ -2182,18 +2676,16 @@ app.get('/', (req, res) => {
             document.getElementById('tutorialQuestion').textContent = lesson.question;
 
             const optionsContainer = document.getElementById('tutorialOptions');
+            optionsContainer.textContent = '';
+            lesson.options.forEach((option, index) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'quiz-option';
+                button.textContent = option;
+                button.addEventListener('click', () => selectTutorialOption(index));
+                optionsContainer.appendChild(button);
+            });
 
-            const rect = targetElement.getBoundingClientRect();
-            const scrollX = window.scrollX || window.pageXOffset || 0;
-            const scrollY = window.scrollY || window.pageYOffset || 0;
-
-            spotlight.style.left = (rect.left + scrollX - 10) + 'px';
-            spotlight.style.top = (rect.top + scrollY - 10) + 'px';
-            spotlight.style.width = (rect.width + 20) + 'px';
-            spotlight.style.height = (rect.height + 20) + 'px';
-
-            tooltip.style.left = (rect.left + scrollX + rect.width / 2 - 175) + 'px';
-            tooltip.style.top = (rect.bottom + scrollY + 20) + 'px';
             document.getElementById('tutorialFeedback').style.display = 'none';
             document.getElementById('tutorialSubmit').disabled = true;
 
@@ -2409,8 +2901,13 @@ app.get('/', (req, res) => {
                     const data = await response.json();
                     currentCash = data.cash;
                     currentPortfolio = data.portfolio;
+                    dailyBonusState = data.dailyBonus || dailyBonusState;
+                    watchlistSymbols = data.watchlist || watchlistSymbols;
                     updateHeader();
                     updateQuickPortfolio();
+                    renderDailyBonus(dailyBonusState);
+                    renderWatchlist(watchlistSymbols);
+                    renderQuickStats();
                 } else {
                     logout();
                 }
@@ -2861,7 +3358,7 @@ app.get('/', (req, res) => {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'X-Session-Token': sessionToken
+                        'X-Session-Token': sessionToken //to identify the user and also strict checks
                     },
                     body: JSON.stringify({
                         symbol: currentSymbol,
