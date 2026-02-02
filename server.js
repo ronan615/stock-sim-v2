@@ -6,70 +6,14 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const Parser = require('rss-parser');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-change-this';
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-const DATA_DIR = path.join(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const TRANSACTIONS_FILE = path.join(DATA_DIR, 'transactions.json');
-
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-let users = {};
-let transactions = [];
-const requestCounts = new Map();
-const suspiciousActivity = new Map();
 const newsParser = new Parser({
     timeout: 10000,
     customFields: {
         item: ['media:content', 'media:thumbnail']
     }
 }); // fixed it 
-const ensureUserDefaults = (user) => {
-    if (!user) return;
-    if (!Array.isArray(user.challengesClaimed)) user.challengesClaimed = [];
-    if (!Array.isArray(user.unlockedFeatures)) user.unlockedFeatures = [];
-    if (!Array.isArray(user.watchlist)) user.watchlist = [];
-    if (typeof user.lastDailyBonusAt !== 'number' && user.lastDailyBonusAt !== null) {
-        user.lastDailyBonusAt = null;
-    }
-};
-const DAILY_BONUS_AMOUNT = 500;
-const normalizeSymbol = (symbol) => {
-    if (!symbol) return null;
-    const trimmed = symbol.toUpperCase().trim();
-    if (!/^[A-Z\.]{1,10}$/.test(trimmed)) return null;
-    return trimmed;
-};
 
-const getDailyBonusStatus = (user) => {
-    ensureUserDefaults(user);
-    const now = Date.now();
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-
-    const lastClaim = user.lastDailyBonusAt;
-    const eligible = !lastClaim || lastClaim < startOfToday.getTime();
-
-    const nextAvailableAt = eligible
-        ? startOfToday.getTime()
-        : startOfToday.getTime() + 24 * 60 * 60 * 1000;
-
-    return {
-        eligible,
-        lastClaim,
-        nextAvailableAt,
-        amount: DAILY_BONUS_AMOUNT
-    };
-};
-//non hard coded tutorial lessons so you can add more later here if you fork the repository just make sure it follows the same format
-const TUTORIAL_LESSONS = [ 
+const TUTORIAL_LESSONS = [
     {
         id: 'stocks-basics',
         element: '#symbolSearch',
@@ -193,6 +137,14 @@ const loadData = () => {
             const data = fs.readFileSync(TRANSACTIONS_FILE, 'utf8');
             transactions = JSON.parse(data);
         }
+        if (fs.existsSync(FORUM_FILE)) {
+            const data = fs.readFileSync(FORUM_FILE, 'utf8');
+            forumThreads = JSON.parse(data);
+        }
+            if (fs.existsSync(DMS_FILE)) {
+                const data = fs.readFileSync(DMS_FILE, 'utf8');
+                directMessages = JSON.parse(data);
+            }
     } catch (error) {
         console.error('Error loading data:', error);
     }
@@ -213,9 +165,27 @@ const saveTransactions = () => {
         console.error('Error saving transactions:', error);
     }
 };
+const saveDirectMessages = () => {
+    try {
+        fs.writeFileSync(DMS_FILE, JSON.stringify(directMessages, null, 2));
+    } catch (error) {
+        console.error('Error saving DMs:', error);
+    }
+};
+
+const saveForum = () => {
+    try {
+        fs.writeFileSync(FORUM_FILE, JSON.stringify(forumThreads, null, 2));
+    } catch (error) {
+        console.error('Error saving forum:', error);
+    }
+};
 
 loadData();
 Object.values(users).forEach(ensureUserDefaults);
+if (!Array.isArray(forumThreads)) {
+    forumThreads = [];
+}
 
 const legacyHashPassword = (password) => {
     return crypto.createHash('sha256').update(password).digest('hex');
@@ -409,6 +379,90 @@ const fetchNewsFeed = async (url) => {
     }));
 };
 
+const buildAvatarUrl = (username) => {
+    const seed = (username || 'trader').trim().toLowerCase();
+    return 'https://api.dicebear.com/api/miniavs/svg?scale=92&seed=' + encodeURIComponent(seed);
+};
+
+const findUserByUsername = (username) => {
+    const normalized = (username || '').toLowerCase();
+    return Object.values(users).find(u => u.username?.toLowerCase() === normalized) || null;
+};
+
+const getUserTotalValue = async (user) => {
+    if (!user) return 0;
+    let totalValue = user.cash || 0;
+    const portfolio = user.portfolio || {};
+
+    for (const symbol of Object.keys(portfolio)) {
+        try {
+            const price = await fetchStockPrice(symbol);
+            totalValue += price * (portfolio[symbol]?.quantity || 0);
+        } catch (error) {
+            const avg = portfolio[symbol]?.avgPrice || 0;
+            totalValue += avg * (portfolio[symbol]?.quantity || 0);
+        }
+    }
+
+    return totalValue;
+};
+
+const getPublicProfile = async (user) => {
+    if (!user) return null;
+    ensureUserDefaults(user);
+    const totalValue = await getUserTotalValue(user);
+    const profit = totalValue - 100000;
+    return {
+        username: user.username,
+        createdAt: user.createdAt || null,
+        bio: user.bio || '',
+        totalValue,
+        cash: user.cash,
+        portfolioValue: totalValue - user.cash,
+        profit,
+        coins: user.coins,
+        inventory: user.inventory,
+        activeBadge: user.activeBadge || '',
+        forumKarma: user.forumKarma || 0
+    };
+};
+
+const getDMConversationsFor = (user) => {
+    if (!user) return [];
+    const username = user.username;
+    const lastRead = user.dmsLastRead || {};
+    const summaries = new Map();
+
+    directMessages.forEach(message => {
+        if (message.from !== username && message.to !== username) return;
+        const other = message.from === username ? message.to : message.from;
+        let entry = summaries.get(other);
+        if (!entry) {
+            entry = { username: other, lastMessage: '', lastMessageAt: 0, unread: 0 };
+            summaries.set(other, entry);
+        }
+
+        if (message.createdAt >= entry.lastMessageAt) {
+            entry.lastMessage = message.body;
+            entry.lastMessageAt = message.createdAt;
+        }
+
+        if (message.to === username && message.createdAt > (lastRead[other] || 0)) {
+            entry.unread += 1;
+        }
+    });
+
+    return Array.from(summaries.values()).sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+};
+
+const getDMConversation = (user, otherUsername) => {
+    if (!user || !otherUsername) return [];
+    const me = user.username;
+    return directMessages
+        .filter(msg => (msg.from === me && msg.to === otherUsername) || (msg.from === otherUsername && msg.to === me))
+        .sort((a, b) => a.createdAt - b.createdAt);
+};
+
 const isChallengeComplete = (challengeId, user, userId) => {
     const portfolio = user?.portfolio || {};
     const userTransactions = transactions.filter(t => t.userId === userId);
@@ -501,7 +555,9 @@ app.post('/api/register', async (req, res) => {
         challengesClaimed: [],
         unlockedFeatures: [],
         watchlist: [],
-        lastDailyBonusAt: null
+        lastDailyBonusAt: null,
+        coins: users[userId].coins || 0,
+        activeBadge: users[userId].activeBadge || ''
     });
 });
 
@@ -565,7 +621,9 @@ app.post('/api/login', async (req, res) => {
         challengesClaimed: user.challengesClaimed,
         unlockedFeatures: user.unlockedFeatures,
         watchlist: user.watchlist || [],
-        dailyBonus: getDailyBonusStatus(user)
+        dailyBonus: getDailyBonusStatus(user),
+        coins: user.coins,
+        activeBadge: user.activeBadge || ''
     });
 });
 
@@ -583,7 +641,9 @@ app.get('/api/portfolio', validateSession, (req, res) => {
         tutorialCompleted: user.tutorialCompleted || false,
         uiTutorialCompleted: user.uiTutorialCompleted || false,
         watchlist: user.watchlist || [],
-        dailyBonus: getDailyBonusStatus(user)
+        dailyBonus: getDailyBonusStatus(user),
+        coins: user.coins,
+        activeBadge: user.activeBadge || ''
     });
 });
 
@@ -732,6 +792,138 @@ app.post('/api/challenges/:id/claim', validateSession, (req, res) => {
     });
 });
 
+app.get('/api/economy', validateSession, async (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const totalValue = await getUserTotalValue(user);
+    const profit = totalValue - 100000;
+    const availableCoins = Math.max(0, Math.floor(profit / PROFIT_COIN_STEP) - user.profitCoinsClaimed);
+
+    res.json({
+        coins: user.coins,
+        profit,
+        availableCoins,
+        inventory: user.inventory,
+        activeBadge: user.activeBadge,
+        items: VIRTUAL_SHOP_ITEMS
+    });
+});
+
+app.post('/api/economy/claim-profit', validateSession, async (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const totalValue = await getUserTotalValue(user);
+    const profit = totalValue - 100000;
+    const availableCoins = Math.max(0, Math.floor(profit / PROFIT_COIN_STEP) - user.profitCoinsClaimed);
+
+    if (availableCoins <= 0) {
+        return res.status(400).json({ error: 'No coins available yet', coins: user.coins, profit, availableCoins: 0 });
+    }
+
+    user.coins += availableCoins;
+    user.profitCoinsClaimed += availableCoins;
+    saveUsers();
+
+    res.json({
+        success: true,
+        coins: user.coins,
+        claimed: availableCoins,
+        profit,
+        availableCoins: 0
+    });
+});
+
+app.post('/api/economy/buy', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { itemId } = req.body;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const item = VIRTUAL_SHOP_ITEMS.find(i => i.id === itemId);
+    if (!item) {
+        return res.status(404).json({ error: 'Item not found' });
+    }
+
+    if (user.inventory.includes(itemId)) {
+        return res.json({ coins: user.coins, inventory: user.inventory });
+    }
+
+    if (user.coins < item.cost) {
+        return res.status(400).json({ error: 'Not enough coins' });
+    }
+
+    user.coins -= item.cost;
+    user.inventory.push(itemId);
+    saveUsers();
+
+    res.json({ coins: user.coins, inventory: user.inventory });
+});
+
+app.post('/api/economy/activate', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { itemId } = req.body;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    if (itemId && !user.inventory.includes(itemId)) {
+        return res.status(400).json({ error: 'Item not owned' });
+    }
+
+    user.activeBadge = itemId || '';
+    saveUsers();
+
+    res.json({ activeBadge: user.activeBadge });
+});
+
+app.get('/api/profile/me', validateSession, async (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const profile = await getPublicProfile(user);
+    res.json(profile);
+});
+
+app.post('/api/profile/me', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { bio } = req.body;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const safeBio = typeof bio === 'string' ? bio.trim().slice(0, 160) : '';
+    user.bio = safeBio;
+    saveUsers();
+    res.json({ bio: user.bio });
+});
+
+app.get('/api/profile/:username', async (req, res) => {
+    const user = findUserByUsername(req.params.username);
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const profile = await getPublicProfile(user);
+    res.json(profile);
+});
+
 app.get('/api/watchlist', validateSession, async (req, res) => {
     const user = users[req.userId];
     if (!user) {
@@ -837,6 +1029,182 @@ app.post('/api/daily-bonus/claim', validateSession, (req, res) => {
         cash: user.cash,
         dailyBonus: nextStatus
     });
+});
+
+app.get('/api/forum/threads', (req, res) => {
+    const threads = (forumThreads || []).slice(0, 200).map(thread => ({
+        id: thread.id,
+        title: thread.title,
+        author: thread.author,
+        createdAt: thread.createdAt,
+        replyCount: (thread.replies || []).length
+    }));
+    res.json(threads);
+});
+
+app.post('/api/forum/threads', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { title, body } = req.body;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const safeTitle = (title || '').trim().slice(0, 80);
+    const safeBody = (body || '').trim().slice(0, 2000);
+    if (!safeTitle || !safeBody) {
+        return res.status(400).json({ error: 'Title and body are required' });
+    }
+
+    const thread = {
+        id: crypto.randomBytes(8).toString('hex'),
+        title: safeTitle,
+        body: safeBody,
+        author: user.username,
+        createdAt: Date.now(),
+        replies: []
+    };
+
+    forumThreads.unshift(thread);
+    user.forumKarma += 1;
+    saveUsers();
+    saveForum();
+
+    res.json({ success: true, thread });
+});
+
+app.get('/api/forum/threads/:id', (req, res) => {
+    const thread = (forumThreads || []).find(t => t.id === req.params.id);
+    if (!thread) {
+        return res.status(404).json({ error: 'Thread not found' });
+    }
+
+    res.json(thread);
+});
+
+app.post('/api/forum/threads/:id/replies', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { body } = req.body;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const thread = (forumThreads || []).find(t => t.id === req.params.id);
+    if (!thread) {
+        return res.status(404).json({ error: 'Thread not found' });
+    }
+
+    const safeBody = (body || '').trim().slice(0, 2000);
+    if (!safeBody) {
+        return res.status(400).json({ error: 'Reply cannot be empty' });
+    }
+
+    const reply = {
+        id: crypto.randomBytes(8).toString('hex'),
+        body: safeBody,
+        author: user.username,
+        createdAt: Date.now()
+    };
+
+    thread.replies = thread.replies || [];
+    thread.replies.push(reply);
+    user.forumKarma += 1;
+    saveUsers();
+    saveForum();
+
+    res.json({ success: true, reply });
+});
+
+app.get('/api/dms/conversations', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const conversations = getDMConversationsFor(user);
+    res.json({ conversations });
+});
+
+app.get('/api/dms/:username', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const target = findUserByUsername(req.params.username);
+    if (!target) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    ensureUserDefaults(user);
+    const messages = getDMConversation(user, target.username);
+    user.dmsLastRead[target.username] = Date.now();
+    saveUsers();
+
+    res.json({ messages });
+});
+
+app.post('/api/dms/send', validateSession, (req, res) => {
+    const user = users[req.userId];
+    const { to, body } = req.body;
+
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const recipient = findUserByUsername(to);
+    if (!recipient) {
+        return res.status(404).json({ error: 'Recipient not found' });
+    }
+
+    const messageBody = (body || '').trim().slice(0, 1200);
+    if (!messageBody) {
+        return res.status(400).json({ error: 'Message cannot be empty' });
+    }
+
+    const message = {
+        id: crypto.randomBytes(8).toString('hex'),
+        from: user.username,
+        to: recipient.username,
+        body: messageBody,
+        createdAt: Date.now()
+    };
+
+    directMessages.push(message);
+    saveDMs();
+
+    res.json({ success: true, message });
+});
+
+app.get('/api/users/explore', validateSession, (req, res) => {
+    const user = users[req.userId];
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+    }
+
+    const search = (req.query.query || '').toLowerCase().trim();
+    const list = Object.values(users).map(u => {
+        ensureUserDefaults(u);
+        const badgeItem = VIRTUAL_SHOP_ITEMS.find(item => item.id === u.activeBadge);
+        return {
+            username: u.username,
+            bio: u.bio || '',
+            coins: u.coins,
+            forumKarma: u.forumKarma || 0,
+            badgeLabel: badgeItem ? badgeItem.name : (u.activeBadge || 'Trader'),
+            profilePicture: buildAvatarUrl(u.username)
+        };
+    });
+
+    const filtered = search
+        ? list.filter(u => u.username.toLowerCase().includes(search))
+        : list;
+
+    filtered.sort((a, b) => (b.coins - a.coins) || a.username.localeCompare(b.username));
+
+    res.json({ users: filtered.slice(0, 60) });
 });
 
 app.post('/api/buy', validateSession, async (req, res) => {
@@ -1018,6 +1386,20 @@ app.get('/api/leaderboard', async (req, res) => {
     
     leaderboard.sort((a, b) => b.totalValue - a.totalValue);
     
+    res.json(leaderboard.slice(0, 100));
+});
+
+app.get('/api/leaderboard/coins', (req, res) => {
+    const leaderboard = Object.values(users).map(user => {
+        ensureUserDefaults(user);
+        return {
+            username: user.username,
+            coins: user.coins,
+            activeBadge: user.activeBadge || ''
+        };
+    });
+
+    leaderboard.sort((a, b) => b.coins - a.coins);
     res.json(leaderboard.slice(0, 100));
 });
 
@@ -1372,6 +1754,25 @@ app.get('/', (req, res) => {
             gap: 16px;
         }
 
+        .header-avatar {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, rgba(107, 191, 51, 0.25), rgba(141, 223, 85, 0.6));
+            padding: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .header-avatar img {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            object-fit: cover;
+            display: block;
+        }
+
         .user-info {
             text-align: right;
         }
@@ -1402,146 +1803,282 @@ app.get('/', (req, res) => {
             background: #3a3a3c;
         }
 
+
+            .explorer-search {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                margin-top: 6px;
+            }
+
+            .explorer-search input {
+                flex: 1;
+                padding: 10px 12px;
+                background: #2c2c2e;
+                border: 1px solid #3a3a3c;
+                border-radius: 8px;
+                color: #fff;
+                font-size: 14px;
+            }
+
+            .explorer-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                gap: 12px;
+                margin-top: 16px;
+            }
+
+            .explorer-card {
+                background: #101014;
+                border: 1px solid #272a2f;
+                border-radius: 12px;
+                padding: 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                cursor: pointer;
+                transition: border-color 0.2s ease, transform 0.2s ease;
+                min-height: 220px;
+            }
+
+            .explorer-card:hover {
+                border-color: #6bbf33;
+                transform: translateY(-2px);
+            }
+
+            .explorer-avatar {
+                width: 72px;
+                height: 72px;
+                border-radius: 50%;
+                overflow: hidden;
+                box-shadow: 0 12px 25px rgba(0, 0, 0, 0.35);
+            }
+
+            .explorer-avatar img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+            }
+
+            .explorer-heading {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 8px;
+            }
+
+            .explorer-bio {
+                font-size: 13px;
+                color: #d3d7de;
+                min-height: 42px;
+            }
+
+            .explorer-meta {
+                display: flex;
+                gap: 12px;
+                font-size: 12px;
+                color: #9aa0a6;
+            }
+
+            .explorer-actions {
+                display: flex;
+                justify-content: flex-end;
+            }
+
+            .explorer-message-btn {
+                font-size: 12px;
+                padding: 6px 14px;
+                border-radius: 8px;
+                white-space: nowrap;
+            }
         .main-content {
-            display: flex;
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 24px;
-            gap: 24px;
-        }
+            #dmWidget {
+                position: fixed;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                display: flex;
+                flex-direction: column-reverse;
+                align-items: center;
+                gap: 12px;
+                z-index: 2000;
+                pointer-events: none;
+            }
 
-        .content-left {
-            flex: 1;
-        }
+            .dm-toggle-button {
+                width: 56px;
+                height: 56px;
+                border-radius: 50%;
+                border: none;
+                background: linear-gradient(135deg, #6bbf33, #8ddf55);
+                color: #000;
+                font-size: 26px;
+                cursor: pointer;
+                box-shadow: 0 22px 45px rgba(0, 0, 0, 0.45);
+                pointer-events: auto;
+            }
 
-        .content-right {
-            width: 350px;
-        }
+            .dm-panel {
+                width: 360px;
+                max-height: 520px;
+                background: #0b0b0d;
+                border-radius: 16px;
+                border: 1px solid #273036;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+                opacity: 0;
+                pointer-events: none;
+                transform: translateY(20px);
+                transition: opacity 0.3s ease, transform 0.3s ease;
+            }
 
-        .card {
-            background: #1c1c1e;
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 24px;
-        }
+            .dm-panel.open {
+                opacity: 1;
+                pointer-events: auto;
+                transform: translateY(0);
+            }
 
-        .overview-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-            gap: 16px;
-            margin-bottom: 20px;
-        }
+            .dm-header {
+                padding: 12px 16px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid #2b2b2f;
+                font-weight: 600;
+            }
 
-        .mini-stat {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
+            .dm-close {
+                border: none;
+                background: transparent;
+                color: #9aa0a6;
+                font-size: 20px;
+                cursor: pointer;
+            }
 
-        .mini-label {
-            font-size: 13px;
-            color: #9aa0a6;
-        }
+            .dm-body {
+                display: grid;
+                grid-template-columns: 140px 1fr;
+                flex: 1;
+                min-height: 0;
+            }
 
-        .mini-value {
-            font-size: 24px;
-            font-weight: 700;
-        }
+            .dm-conversations {
+                border-right: 1px solid #23262b;
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+            }
 
-        .pill {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 999px;
-            font-size: 12px;
-            font-weight: 600;
-            color: #000;
-            background: #6bbf33;
-        }
+            .dm-conversations-header {
+                padding: 10px 12px;
+                border-bottom: 1px solid #1c1c1f;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
 
-        .bonus-card .card-header {
-            margin-bottom: 12px;
-        }
+            .dm-conversations-header strong {
+                font-size: 14px;
+            }
 
-        .bonus-meta {
-            font-size: 13px;
-            color: #9aa0a6;
-            margin-top: 8px;
-        }
+            .dm-conversations-control {
+                display: flex;
+                gap: 6px;
+                align-items: center;
+            }
 
-        .bonus-actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 12px;
-        }
+            .dm-new-user-input {
+                flex: 1;
+                padding: 8px 10px;
+                border-radius: 8px;
+                border: 1px solid #2b2b2f;
+                background: #16181c;
+                color: #fff;
+                font-size: 13px;
+            }
 
-        .bonus-btn {
-            flex: 1;
-            padding: 12px;
-            border: none;
-            border-radius: 8px;
-            font-weight: 700;
-            cursor: pointer;
-            background: #6bbf33;
-            color: #000;
-            transition: background 0.2s ease;
-        }
+            .dm-start-btn {
+                padding: 6px 10px;
+                font-size: 12px;
+                border-radius: 8px;
+            }
 
-        .bonus-btn:disabled {
-            background: #2c2c2e;
-            color: #888;
-            cursor: not-allowed;
-        }
+            .dm-conversation-list {
+                flex: 1;
+                overflow-y: auto;
+            }
 
-        .watchlist-header {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 12px;
-        }
+            .dm-conversation {
+                padding: 12px;
+                cursor: pointer;
+                border-bottom: 1px solid #1c1c1f;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
 
-        .watchlist-input {
-            flex: 1;
-            padding: 12px;
-            background: #2c2c2e;
-            border: 1px solid #3a3a3c;
-            border-radius: 8px;
-            color: #fff;
-        }
+            .dm-conversation.active {
+                background: rgba(107, 191, 51, 0.15);
+            }
 
-        .watchlist-add-btn {
-            padding: 12px 14px;
-            background: #6bbf33;
-            color: #000;
-            border: none;
-            border-radius: 8px;
-            font-weight: 700;
-            cursor: pointer;
-        }
+            .dm-message-count {
+                font-size: 11px;
+                color: #6bbf33;
+            }
 
-        .watchlist-list {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
+            .dm-chat {
+                padding: 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
 
-        .watchlist-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px;
-            background: #2c2c2e;
-            border-radius: 10px;
-        }
+            .dm-messages {
+                flex: 1;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                padding-right: 4px;
+            }
 
-        .watchlist-symbol {
-            font-weight: 700;
-            cursor: pointer;
-        }
+            .dm-message {
+                padding: 10px 12px;
+                border-radius: 10px;
+                background: #1f1f22;
+                font-size: 13px;
+            }
 
-        .watchlist-price {
-            font-size: 14px;
-            color: #9aa0a6;
-            margin-left: 6px;
-        }
+            .dm-message.self {
+                background: #6bbf33;
+                color: #000;
+                align-self: flex-end;
+            }
+
+            .dm-meta {
+                font-size: 11px;
+                color: #9aa0a6;
+                margin-top: 4px;
+            }
+
+            .dm-input { 
+                resize: none;
+                background: #17181c;
+                color: #fff;
+                border: 1px solid #2b2b2f;
+                border-radius: 10px;
+                font-size: 13px;
+                padding: 8px;
+            }
+
+            .dm-send-btn {
+                align-self: flex-end;
+                margin-top: 4px;
+                font-size: 14px;
+                padding: 8px 14px;
+            }
 
         .watchlist-remove {
             border: none;
@@ -1804,6 +2341,278 @@ app.get('/', (req, res) => {
             background: #2c2c2e;
             border-radius: 8px;
             margin-bottom: 12px;
+        }
+
+        .profile-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+        }
+
+        .badge-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #2c2c2e;
+            font-size: 12px;
+            color: #d1d5db;
+        }
+
+        .shop-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px;
+            border-radius: 10px;
+            background: #2c2c2e;
+            margin-bottom: 10px;
+        }
+
+        .shop-item button {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            background: #6bbf33;
+            color: #000;
+        }
+
+        .shop-item button:disabled {
+            background: #3a3a3c;
+            color: #777;
+            cursor: not-allowed;
+        }
+
+        .forum-thread {
+            background: #2c2c2e;
+            border-radius: 10px;
+            padding: 16px;
+            margin-bottom: 12px;
+            cursor: pointer;
+        }
+
+        .forum-thread h4 {
+            margin-bottom: 6px;
+            font-size: 16px;
+        }
+
+        .forum-meta {
+            font-size: 12px;
+            color: #9aa0a6;
+        }
+
+        .forum-editor textarea {
+            width: 100%;
+            min-height: 120px;
+            background: #2c2c2e;
+            border: 1px solid #3a3a3c;
+            border-radius: 8px;
+            color: #fff;
+            padding: 12px;
+            resize: vertical;
+        }
+
+        .forum-editor input {
+            width: 100%;
+            padding: 12px;
+            background: #2c2c2e;
+            border: 1px solid #3a3a3c;
+            border-radius: 8px;
+            color: #fff;
+            margin-bottom: 12px;
+        }
+
+        .forum-reply {
+            padding: 12px;
+            background: #1f1f22;
+            border-radius: 8px;
+            margin-bottom: 10px;
+        }
+
+        #dmWidget {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column-reverse;
+            align-items: center;
+            gap: 12px;
+            z-index: 2000;
+            pointer-events: none;
+        }
+
+        .dm-toggle-button {
+            width: 56px;
+            height: 56px;
+            border-radius: 50%;
+            border: none;
+            background: linear-gradient(135deg, #6bbf33, #8ddf55);
+            color: #000;
+            font-size: 26px;
+            cursor: pointer;
+            box-shadow: 0 22px 45px rgba(0, 0, 0, 0.45);
+            pointer-events: auto;
+        }
+
+        .dm-panel {
+            width: 360px;
+            max-height: 520px;
+            background: #0b0b0d;
+            border-radius: 16px;
+            border: 1px solid #273036;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(20px);
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+
+        .dm-panel.open {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translateY(0);
+        }
+
+        .dm-header {
+            padding: 12px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #2b2b2f;
+            font-weight: 600;
+        }
+
+        .dm-close {
+            border: none;
+            background: transparent;
+            color: #9aa0a6;
+            font-size: 20px;
+            cursor: pointer;
+        }
+
+        .dm-body {
+            display: grid;
+            grid-template-columns: 140px 1fr;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .dm-conversations {
+            border-right: 1px solid #23262b;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .dm-conversations-header {
+            padding: 10px 12px;
+            border-bottom: 1px solid #1c1c1f;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .dm-conversations-control {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .dm-new-user-input {
+            flex: 1;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid #2b2b2f;
+            background: #16181c;
+            color: #fff;
+            font-size: 13px;
+        }
+
+        .dm-start-btn {
+            padding: 6px 10px;
+            font-size: 12px;
+            border-radius: 8px;
+        }
+
+        .dm-conversation-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .dm-conversation {
+            padding: 12px;
+            cursor: pointer;
+            border-bottom: 1px solid #1c1c1f;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .dm-conversation.active {
+            background: rgba(107, 191, 51, 0.15);
+        }
+
+        .dm-message-count {
+            font-size: 11px;
+            color: #6bbf33;
+        }
+
+        .dm-chat {
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .dm-messages {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding-right: 4px;
+        }
+
+        .dm-message {
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: #1f1f22;
+            font-size: 13px;
+        }
+
+        .dm-message.self {
+            background: #6bbf33;
+            color: #000;
+            align-self: flex-end;
+        }
+
+        .dm-meta {
+            font-size: 11px;
+            color: #9aa0a6;
+            margin-top: 4px;
+        }
+
+        .dm-input {
+            resize: none;
+            background: #17181c;
+            color: #fff;
+            border: 1px solid #2b2b2f;
+            border-radius: 10px;
+            font-size: 13px;
+            padding: 8px;
+        }
+
+        .dm-send-btn {
+            align-self: flex-end;
+            margin-top: 4px;
+            font-size: 14px;
+            padding: 8px 14px;
         }
 
         .news-grid {
@@ -2235,9 +3044,15 @@ app.get('/', (req, res) => {
                     <a href="#" class="nav-tab" data-tab="portfolio" onclick="showTab(event, 'portfolio')">Portfolio</a>
                     <a href="#" class="nav-tab" data-tab="leaderboard" onclick="showTab(event, 'leaderboard')">Leaderboard</a>
                     <a href="#" class="nav-tab" data-tab="history" onclick="showTab(event, 'history')">History</a>
+                    <a href="#" class="nav-tab" data-tab="profile" onclick="showTab(event, 'profile')">Profile</a>
+                    <a href="#" class="nav-tab" data-tab="explorer" onclick="showTab(event, 'explorer')">Users</a>
+                    <a href="#" class="nav-tab" data-tab="forum" onclick="showTab(event, 'forum')">Forum</a>
                 </nav>
             </div>
             <div class="header-right">
+                <div class="header-avatar">
+                    <img id="headerAvatar" alt="Trader avatar" loading="lazy">
+                </div>
                 <div class="user-info">
                     <div class="username" id="headerUsername"></div>
                     <div class="cash-balance" id="headerCash"></div>
@@ -2312,6 +3127,12 @@ app.get('/', (req, res) => {
                         </div>
                         <div id="leaderboardList"></div>
                     </div>
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">Top Coin Holders</h2>
+                        </div>
+                        <div id="coinLeaderboardList"></div>
+                    </div>
                 </div>
 
                 <div id="historyTab" class="tab-content" style="display: none;">
@@ -2321,6 +3142,61 @@ app.get('/', (req, res) => {
                         </div>
                         <div id="transactionList"></div>
                     </div>
+                </div>
+
+                <div id="profileTab" class="tab-content" style="display: none;">
+                    <div class="profile-grid">
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">Profile</h2>
+                            </div>
+                            <div id="profileSummary"></div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header">
+                                <h3 class="card-title">Bio</h3>
+                            </div>
+                            <div class="forum-editor">
+                                <textarea id="profileBio" placeholder="Share your trading style or goals..."></textarea>
+                                <button class="bonus-btn" style="margin-top: 12px;" onclick="saveProfileBio()">Save Bio</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card" style="margin-top: 24px;">
+                        <div class="card-header">
+                            <h3 class="card-title">Virtual Economy</h3>
+                            <span class="pill" id="coinBalance">0 Coins</span>
+                        </div>
+                        <div id="economyStatus"></div>
+                        <div class="bonus-actions" style="margin-top: 16px;">
+                            <button class="bonus-btn" id="claimProfitCoins" onclick="claimProfitCoins()">Claim profit coins</button>
+                        </div>
+                        <div style="margin-top: 16px;" id="shopList"></div>
+                    </div>
+                </div>
+
+                <div id="forumTab" class="tab-content" style="display: none;">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">Forum</h2>
+                        </div>
+                        <div id="forumThreads"></div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3 class="card-title">Start a new thread</h3>
+                        </div>
+                        <div class="forum-editor">
+                            <input id="forumTitle" placeholder="Thread title">
+                            <textarea id="forumBody" placeholder="Ask a question or share an insight..."></textarea>
+                            <button class="bonus-btn" style="margin-top: 12px;" onclick="createForumThread()">Post Thread</button>
+                        </div>
+                    </div>
+
+                    <div class="card" id="forumThreadView" style="display:none;"></div>
                 </div>
 
             </div>
@@ -2346,6 +3222,36 @@ app.get('/', (req, res) => {
         </div>
     </div>
 
+    <div id="dmWidget">
+        <div id="dmPanel" class="dm-panel">
+            <div class="dm-header">
+                <span>Direct Messages</span>
+                <button id="dmCloseButton" class="dm-close" aria-label="Close">×</button>
+            </div>
+            <div class="dm-body">
+                <div class="dm-conversations">
+                    <div class="dm-conversations-header">
+                        <div>
+                            <strong>Conversations</strong>
+                            <div class="mini-label">Start typing a username below</div>
+                        </div>
+                        <div class="dm-conversations-control">
+                            <input id="dmNewUserInput" class="dm-new-user-input" placeholder="Username" spellcheck="false" />
+                            <button id="dmStartButton" type="button" class="bonus-btn dm-start-btn">Chat</button>
+                        </div>
+                    </div>
+                    <div id="dmConversations" class="dm-conversation-list"></div>
+                </div>
+                <div class="dm-chat">
+                    <div class="dm-messages" id="dmMessages"></div>
+                    <textarea id="dmMessageInput" class="dm-input" rows="3" placeholder="Message..." maxlength="900"></textarea>
+                    <button id="dmSendButton" class="bonus-btn dm-send-btn">Send</button>
+                </div>
+            </div>
+        </div>
+        <button id="dmToggleButton" class="dm-toggle-button" aria-label="Open direct messages">💬</button>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script> 
@@ -2361,6 +3267,29 @@ app.get('/', (req, res) => {
         let currentRange = '1d';
         let dailyBonusState = null;
         let watchlistSymbols = [];
+        let dmState = { open: false, activeUser: null, conversations: [] };
+        let dmInitialized = false;
+        let currentCoins = 0;
+        let activeBadge = '';
+        let economyState = null;
+        const getAvatarForUsername = (username) => {
+            if (!username) return '';
+            return 'https://api.dicebear.com/api/miniavs/svg?scale=92&seed=' + encodeURIComponent(username);
+        };
+        let currentAvatarUrl = '';
+        let explorerInitialized = false;
+        const escapeHtml = (value) => {
+            if (value === null || value === undefined) return '';
+            return String(value).replace(/[&<>"']/g, (char) => {
+                return {
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    '"': '&quot;',
+                    "'": '&#39;'
+                }[char] || '';
+            });
+        };
 
         document.addEventListener('DOMContentLoaded', initApp);
 
@@ -2386,8 +3315,11 @@ app.get('/', (req, res) => {
                 currentCash = data.cash;
                 currentPortfolio = data.portfolio;
                 currentUsername = data.username;
+                currentAvatarUrl = getAvatarForUsername(currentUsername);
                 dailyBonusState = data.dailyBonus || null;
                 watchlistSymbols = data.watchlist || [];
+                currentCoins = data.coins || 0;
+                activeBadge = data.activeBadge || '';
                 document.getElementById('appContainer').style.display = 'block';
                 showApp();
             } catch (error) {
@@ -2414,6 +3346,12 @@ app.get('/', (req, res) => {
 
         function formatNumber(value) {
             return new Intl.NumberFormat('en-US').format(value);
+        }
+
+        function getBadgeLabel(itemId) {
+            if (!itemId) return '';
+            const item = (economyState?.items || []).find(i => i.id === itemId);
+            return item ? item.name : itemId;
         }
 
         const formatTimeUntil = (timestamp) => {
@@ -2468,6 +3406,322 @@ app.get('/', (req, res) => {
                 showToast('Daily bonus claimed!', 'success');
             } catch (error) {
                 showToast('Unable to claim bonus', 'error');
+            }
+        }
+
+        function initDMWidget() {
+            if (dmInitialized) return;
+            dmInitialized = true;
+
+            const toggle = document.getElementById('dmToggleButton');
+            const close = document.getElementById('dmCloseButton');
+            const sendBtn = document.getElementById('dmSendButton');
+            const input = document.getElementById('dmMessageInput');
+            const newUserInput = document.getElementById('dmNewUserInput');
+            const startBtn = document.getElementById('dmStartButton');
+
+            if (toggle) toggle.addEventListener('click', toggleDMWidget);
+            if (close) close.addEventListener('click', closeDMWidget);
+            if (sendBtn) sendBtn.addEventListener('click', sendDMMessage);
+            if (input) {
+                input.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                        event.preventDefault();
+                        sendDMMessage();
+                    }
+                });
+            }
+
+            if (startBtn) startBtn.addEventListener('click', startDMConversation);
+            if (newUserInput) {
+                newUserInput.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter') {
+                        event.preventDefault();
+                        startDMConversation();
+                    }
+                });
+            }
+        }
+
+        function toggleDMWidget() {
+            const panel = document.getElementById('dmPanel');
+            if (!panel) return;
+            if (panel.classList.contains('open')) {
+                closeDMWidget();
+            } else {
+                ensureDMPanelOpen();
+            }
+        }
+
+        function ensureDMPanelOpen(load = true) {
+            const panel = document.getElementById('dmPanel');
+            if (!panel) return;
+            const wasOpen = panel.classList.contains('open');
+            panel.classList.add('open');
+            dmState.open = true;
+            if (!wasOpen && load) {
+                loadDMConversations();
+            }
+        }
+
+        function closeDMWidget() {
+            const panel = document.getElementById('dmPanel');
+            if (!panel) return;
+            panel.classList.remove('open');
+            dmState.open = false;
+        }
+
+        function startDMConversation() {
+            const input = document.getElementById('dmNewUserInput');
+            const username = (input?.value || '').trim();
+            if (!username) {
+                showToast('Enter a trader username to start chatting', 'error');
+                return;
+            }
+            if (currentUsername && username.toLowerCase() === currentUsername.toLowerCase()) {
+                showToast('You can already see yourself in the lobby', 'error');
+                return;
+            }
+            if (input) input.value = '';
+            ensureDMPanelOpen();
+            openDMConversation(username);
+        }
+
+        function openExplorerDM(username) {
+            if (!username) return;
+            if (currentUsername && username.toLowerCase() === currentUsername.toLowerCase()) {
+                showToast('You can already see yourself in the lobby', 'error');
+                return;
+            }
+            ensureDMPanelOpen();
+            openDMConversation(username);
+        }
+
+        async function loadDMConversations() {
+            try {
+                const response = await fetch('/api/dms/conversations', {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load conversations');
+                }
+
+                dmState.conversations = data.conversations || [];
+                renderDMConversations();
+                if (!dmState.activeUser && dmState.conversations.length) {
+                    openDMConversation(dmState.conversations[0].username);
+                }
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        function renderDMConversations() {
+            const container = document.getElementById('dmConversations');
+            if (!container) return;
+            const baseList = dmState.conversations || [];
+            const displayList = [...baseList];
+            if (dmState.activeUser && !displayList.some(conv => conv.username === dmState.activeUser)) {
+                displayList.unshift({
+                    username: dmState.activeUser,
+                    lastMessage: '',
+                    lastMessageAt: null,
+                    unread: 0,
+                    placeholder: true
+                });
+            }
+
+            if (!displayList.length) {
+                container.innerHTML = '<div class="empty-state"><p>No conversations yet</p></div>';
+                return;
+            }
+
+            container.innerHTML = displayList.map(conv => {
+                const activeClass = dmState.activeUser === conv.username ? ' active' : '';
+                const preview = conv.lastMessage
+                    ? (conv.lastMessage.length > 40 ? conv.lastMessage.slice(0, 40) + '…' : conv.lastMessage)
+                    : (conv.placeholder ? 'Start chatting' : 'No messages yet');
+                const safePreview = escapeHtml(preview);
+                const timeStamp = conv.lastMessageAt ? formatDateTime(conv.lastMessageAt) : '';
+                const safeTime = escapeHtml(timeStamp);
+                const safeUsername = escapeHtml(conv.username);
+                const unread = conv.unread ? '<span class="dm-message-count">' + conv.unread + ' new</span>' : '';
+                return '<div class="dm-conversation' + activeClass + '" data-user="' + safeUsername + '">'
+                    + '<strong>' + safeUsername + '</strong>'
+                    + '<div class="dm-meta">' + safePreview + '</div>'
+                    + '<div class="dm-meta">' + (safeTime || '') + '</div>'
+                    + unread
+                    + '</div>';
+            }).join('');
+
+            container.querySelectorAll('.dm-conversation').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const username = btn.dataset.user;
+                    openDMConversation(username);
+                });
+            });
+        }
+
+        async function openDMConversation(username) {
+            if (!username) return;
+
+            dmState.activeUser = username;
+            renderDMConversations();
+
+            try {
+                const response = await fetch('/api/dms/' + encodeURIComponent(username), {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load conversation');
+                }
+
+                renderDMMessages(data.messages || []);
+                loadDMConversations();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        function renderDMMessages(messages) {
+            const container = document.getElementById('dmMessages');
+            if (!container) return;
+            if (!messages.length) {
+                container.innerHTML = '<div class="empty-state"><p>No messages yet</p></div>';
+                return;
+            }
+
+            container.innerHTML = messages.map(msg => {
+                const self = msg.from === currentUsername ? ' self' : '';
+                const content = escapeHtml(msg.body);
+                const sender = escapeHtml(msg.from);
+                return '<div class="dm-message' + self + '">' + content 
+                    + '<div class="dm-meta">' + sender + ' • ' + formatDateTime(msg.createdAt) + '</div>'
+                    + '</div>';
+            }).join('');
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function sendDMMessage() {
+            const recipient = dmState.activeUser;
+            const input = document.getElementById('dmMessageInput');
+            if (!recipient) {
+                showToast('Select a conversation first', 'error');
+                return;
+            }
+            const body = (input?.value || '').trim();
+            if (!body) {
+                showToast('Message cannot be empty', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/dms/send', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ to: recipient, body })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to send message');
+                }
+
+                if (input) input.value = '';
+                openDMConversation(recipient);
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        function initExplorerControls() {
+            if (explorerInitialized) return;
+            explorerInitialized = true;
+
+            const input = document.getElementById('explorerSearchInput');
+            const button = document.getElementById('explorerSearchButton');
+
+            const searchHandler = () => loadExplorerTab((input?.value || '').trim());
+
+            if (button) {
+                button.addEventListener('click', searchHandler);
+            }
+
+            if (input) {
+                input.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter') {
+                        event.preventDefault();
+                        searchHandler();
+                    }
+                });
+            }
+        }
+
+        async function loadExplorerTab(query = '') {
+            const container = document.getElementById('explorerContent');
+            if (!container) return;
+            const searchTerm = (query || '').trim();
+            container.innerHTML = '<div class="loading">Loading traders...</div>';
+
+            try {
+                const params = searchTerm ? '?query=' + encodeURIComponent(searchTerm) : '';
+                const response = await fetch('/api/users/explore' + params, {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load traders');
+                }
+
+                const list = data.users || [];
+                if (!list.length) {
+                    container.innerHTML = '<div class="empty-state"><p>No users found.</p></div>';
+                    return;
+                }
+
+                const html = list.map(user => {
+                    const username = escapeHtml(user.username);
+                    const bio = escapeHtml(user.bio || 'No bio yet');
+                    const badgeLabel = escapeHtml(user.badgeLabel || 'Trader');
+                    const coinsLabel = formatNumber(user.coins || 0);
+                    const karmaLabel = formatNumber(user.forumKarma || 0);
+                    const profilePicture = user.profilePicture || getAvatarForUsername(user.username);
+
+                    return '<article class="explorer-card" data-user="' + username + '">'
+                        + '<div class="explorer-avatar"><img src="' + profilePicture + '" alt="' + username + ' avatar"></div>'
+                        + '<div class="explorer-heading">'
+                        + '<strong>' + username + '</strong>'
+                        + '<span class="badge-pill">' + badgeLabel + '</span>'
+                        + '</div>'
+                        + '<p class="explorer-bio">' + (bio || 'No bio yet') + '</p>'
+                        + '<div class="explorer-meta"><span>' + coinsLabel + ' coins</span><span>' + karmaLabel + ' karma</span></div>'
+                        + '<div class="explorer-actions"><button type="button" class="bonus-btn explorer-message-btn">Message</button></div>'
+                        + '</article>';
+                }).join('');
+
+                container.innerHTML = html;
+                container.querySelectorAll('.explorer-card').forEach(card => {
+                    const targetUser = (card.dataset.user || '').trim();
+                    card.addEventListener('click', () => {
+                        openExplorerDM(targetUser);
+                    });
+                });
+                container.querySelectorAll('.explorer-message-btn').forEach(btn => {
+                    btn.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        const targetCard = btn.closest('.explorer-card');
+                        const targetUser = (targetCard?.dataset.user || '').trim();
+                        if (targetUser) {
+                            openExplorerDM(targetUser);
+                        }
+                    });
+                });
+            } catch (error) {
+                container.innerHTML = '<div class="empty-state"><p>' + escapeHtml(error.message) + '</p></div>';
             }
         }
 
@@ -2566,12 +3820,367 @@ app.get('/', (req, res) => {
             const stats = [
                 { label: 'Holdings', value: holdings },
                 { label: 'Shares owned', value: totalShares },
-                { label: 'Cash', value: formatCurrency(currentCash) }
+                { label: 'Cash', value: formatCurrency(currentCash) },
+                { label: 'Coins', value: currentCoins }
             ];
             container.innerHTML = stats.map(s => {
                 const val = (typeof s.value === 'number' && s.label !== 'Cash') ? formatNumber(s.value) : s.value;
                 return '<div class="quick-stat"><div class="mini-label">' + s.label + '</div><div class="mini-value">' + val + '</div></div>';
             }).join('');
+        }
+
+        function formatDateTime(ts) {
+            if (!ts) return '';
+            const date = new Date(ts);
+            return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        async function loadEconomy() {
+            try {
+                const response = await fetch('/api/economy', {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load economy');
+                }
+                economyState = data;
+                currentCoins = data.coins || currentCoins;
+                renderEconomy();
+                updateHeader();
+                renderQuickStats();
+            } catch (error) {
+                // ignore
+            }
+        }
+
+        function renderEconomy() {
+            const balance = document.getElementById('coinBalance');
+            const status = document.getElementById('economyStatus');
+            const shopList = document.getElementById('shopList');
+            const claimBtn = document.getElementById('claimProfitCoins');
+
+            if (!balance || !status || !shopList) return;
+            const coins = economyState?.coins ?? currentCoins;
+            balance.textContent = coins + ' Coins';
+
+            const availableCoins = economyState?.availableCoins ?? 0;
+            const profit = economyState?.profit ?? 0;
+            status.innerHTML = '<div class="mini-label">Profit: ' + formatCurrency(profit) + '</div>'
+                + '<div class="mini-label" style="margin-top:6px;">Coins available to claim: ' + availableCoins + '</div>';
+
+            if (claimBtn) {
+                claimBtn.disabled = availableCoins <= 0;
+            }
+
+            const items = economyState?.items || [];
+            const inventory = economyState?.inventory || [];
+
+            shopList.innerHTML = items.map(item => {
+                const owned = inventory.includes(item.id);
+                const isActive = activeBadge === item.id;
+                const buttonLabel = owned ? (isActive ? 'Active' : 'Activate') : ('Buy • ' + item.cost + 'c');
+                const disabled = owned ? isActive : (coins < item.cost);
+                return '<div class="shop-item">'
+                    + '<div>'
+                    + '<div style="font-weight:600;">' + item.name + '</div>'
+                    + '<div class="mini-label">' + item.description + '</div>'
+                    + '</div>'
+                    + '<button data-item="' + item.id + '" class="shop-action" ' + (disabled ? 'disabled' : '') + '>' + buttonLabel + '</button>'
+                    + '</div>';
+            }).join('');
+
+            // Attach button handlers (use dataset to avoid inline onclick quoting issues)
+            try {
+                shopList.querySelectorAll('.shop-action').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const id = e.currentTarget.dataset.item;
+                        if (inventory.includes(id)) {
+                            activateEconomyItem(id);
+                        } else {
+                            buyEconomyItem(id);
+                        }
+                    });
+                });
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        async function claimProfitCoins() {
+            try {
+                const response = await fetch('/api/economy/claim-profit', {
+                    method: 'POST',
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'No coins available', 'error');
+                    return;
+                }
+                currentCoins = data.coins;
+                showToast('Claimed ' + data.claimed + ' coin(s)', 'success');
+                await loadEconomy();
+            } catch (error) {
+                showToast('Unable to claim coins', 'error');
+            }
+        }
+
+        async function buyEconomyItem(itemId) {
+            try {
+                const response = await fetch('/api/economy/buy', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ itemId })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Unable to buy item', 'error');
+                    return;
+                }
+                currentCoins = data.coins;
+                economyState.inventory = data.inventory || economyState.inventory;
+                showToast('Item purchased', 'success');
+                renderEconomy();
+                renderQuickStats();
+            } catch (error) {
+                showToast('Unable to buy item', 'error');
+            }
+        }
+
+        async function activateEconomyItem(itemId) {
+            try {
+                const response = await fetch('/api/economy/activate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ itemId })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Unable to activate', 'error');
+                    return;
+                }
+                activeBadge = data.activeBadge || '';
+                showToast('Badge activated', 'success');
+                renderEconomy();
+                updateHeader();
+            } catch (error) {
+                showToast('Unable to activate', 'error');
+            }
+        }
+
+        async function loadProfileTab() {
+            const container = document.getElementById('profileSummary');
+            const bioInput = document.getElementById('profileBio');
+            if (!container) return;
+
+            container.innerHTML = '<div class="loading">Loading...</div>';
+            try {
+                const response = await fetch('/api/profile/me', {
+                    headers: { 'X-Session-Token': sessionToken }
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load profile');
+                }
+
+                bioInput.value = data.bio || '';
+                currentCoins = data.coins || currentCoins;
+                activeBadge = data.activeBadge || activeBadge;
+
+                const badgeLabel = getBadgeLabel(activeBadge);
+                const badgeHtml = badgeLabel ? ('<span class="badge-pill">' + badgeLabel + '</span>') : '<span class="badge-pill">No badge active</span>';
+
+                container.innerHTML = ''
+                    + '<div class="mini-stat"><span class="mini-label">Username</span><span class="mini-value">' + data.username + '</span></div>'
+                    + '<div class="mini-stat" style="margin-top:12px;"><span class="mini-label">Joined</span><span>' + (data.createdAt ? formatDateTime(data.createdAt) : '-') + '</span></div>'
+                    + '<div style="margin-top:12px;">' + badgeHtml + '</div>'
+                    + '<div class="mini-stat" style="margin-top:16px;"><span class="mini-label">Total Value</span><span class="mini-value">' + formatCurrency(data.totalValue) + '</span></div>'
+                    + '<div class="mini-stat" style="margin-top:8px;"><span class="mini-label">Profit</span><span>' + formatCurrency(data.profit) + '</span></div>'
+                    + '<div class="mini-stat" style="margin-top:8px;"><span class="mini-label">Coins</span><span>' + formatNumber(data.coins) + '</span></div>'
+                    + '<div class="mini-stat" style="margin-top:8px;"><span class="mini-label">Forum Karma</span><span>' + formatNumber(data.forumKarma) + '</span></div>';
+
+                await loadEconomy();
+            } catch (error) {
+                container.innerHTML = '<div class="empty-state"><p>' + error.message + '</p></div>';
+            }
+        }
+
+        async function saveProfileBio() {
+            const input = document.getElementById('profileBio');
+            const bio = (input?.value || '').trim();
+            try {
+                const response = await fetch('/api/profile/me', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ bio })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Unable to save bio', 'error');
+                    return;
+                }
+                input.value = data.bio || '';
+                showToast('Bio updated', 'success');
+            } catch (error) {
+                showToast('Unable to save bio', 'error');
+            }
+        }
+
+        async function loadForumTab() {
+            const container = document.getElementById('forumThreads');
+            const threadView = document.getElementById('forumThreadView');
+            if (!container) return;
+            container.innerHTML = '<div class="loading">Loading...</div>';
+            if (threadView) threadView.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/forum/threads');
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load forum');
+                }
+
+                if (!data.length) {
+                    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">💬</div><p>No threads yet</p></div>';
+                    return;
+                }
+
+                container.innerHTML = data.map(thread => {
+                    return '<div class="forum-thread" data-thread="' + thread.id + '">'
+                        + '<h4>' + thread.title + '</h4>'
+                        + '<div class="forum-meta">' + thread.author + ' • ' + formatDateTime(thread.createdAt) + ' • ' + thread.replyCount + ' replies</div>'
+                        + '</div>';
+                }).join('');
+
+                // attach click listeners to open threads (avoid inline onclick quoting)
+                try {
+                    container.querySelectorAll('.forum-thread').forEach(item => {
+                        item.addEventListener('click', (e) => {
+                            const id = e.currentTarget.dataset.thread;
+                            if (id) openForumThread(id);
+                        });
+                    });
+                } catch (e) {}
+            } catch (error) {
+                container.innerHTML = '<div class="empty-state"><p>' + error.message + '</p></div>';
+            }
+        }
+
+        async function createForumThread() {
+            const title = document.getElementById('forumTitle').value.trim();
+            const body = document.getElementById('forumBody').value.trim();
+            if (!title || !body) {
+                showToast('Title and body are required', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/forum/threads', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ title, body })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Unable to create thread', 'error');
+                    return;
+                }
+                document.getElementById('forumTitle').value = '';
+                document.getElementById('forumBody').value = '';
+                showToast('Thread posted', 'success');
+                loadForumTab();
+            } catch (error) {
+                showToast('Unable to create thread', 'error');
+            }
+        }
+
+        async function openForumThread(threadId) {
+            const threadView = document.getElementById('forumThreadView');
+            if (!threadView) return;
+
+            threadView.style.display = 'block';
+            threadView.innerHTML = '<div class="loading">Loading...</div>';
+
+            try {
+                const response = await fetch('/api/forum/threads/' + threadId);
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Unable to load thread');
+                }
+
+                const replies = (data.replies || []).map(reply => {
+                    return '<div class="forum-reply">'
+                        + '<div style="font-weight:600;">' + reply.author + '</div>'
+                        + '<div class="forum-meta">' + formatDateTime(reply.createdAt) + '</div>'
+                        + '<div style="margin-top:8px;">' + reply.body + '</div>'
+                        + '</div>';
+                }).join('');
+
+                threadView.innerHTML = ''
+                    + '<div class="card-header"><h3 class="card-title">' + data.title + '</h3></div>'
+                    + '<div class="forum-meta">' + data.author + ' • ' + formatDateTime(data.createdAt) + '</div>'
+                    + '<div style="margin-top:12px;">' + data.body + '</div>'
+                    + '<div style="margin-top:16px;">' + replies + '</div>'
+                    + '<div class="forum-editor" style="margin-top:16px;">'
+                    + '<textarea id="forumReplyBody" placeholder="Write a reply..."></textarea>'
+                    + '<button data-thread="' + data.id + '" class="bonus-btn forum-reply-btn" style="margin-top:12px;">Reply</button>'
+                    + '</div>';
+
+                // attach listener for reply button
+                try {
+                    const replyBtn = threadView.querySelector('.forum-reply-btn');
+                    if (replyBtn) {
+                        replyBtn.addEventListener('click', (e) => {
+                            const id = e.currentTarget.dataset.thread;
+                            postForumReply(id);
+                        });
+                    }
+                } catch (e) {}
+            } catch (error) {
+                threadView.innerHTML = '<div class="empty-state"><p>' + error.message + '</p></div>';
+            }
+        }
+
+        async function postForumReply(threadId) {
+            const body = document.getElementById('forumReplyBody').value.trim();
+            if (!body) {
+                showToast('Reply cannot be empty', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/forum/threads/' + threadId + '/replies', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({ body })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showToast(data.error || 'Unable to reply', 'error');
+                    return;
+                }
+                showToast('Reply posted', 'success');
+                openForumThread(threadId);
+                loadForumTab();
+            } catch (error) {
+                showToast('Unable to reply', 'error');
+            }
         }
 
         function logout() {
@@ -2592,7 +4201,10 @@ app.get('/', (req, res) => {
             renderWatchlist(watchlistSymbols);
             loadWatchlist();
             renderQuickStats();
+            loadEconomy();
             checkAndShowTutorial();
+            initExplorerControls();
+            initDMWidget();
         }
 
         let tutorialState = {
@@ -2886,9 +4498,19 @@ app.get('/', (req, res) => {
 
 
         function updateHeader() {
-            document.getElementById('headerUsername').textContent = currentUsername;
+            const badgeLabel = getBadgeLabel(activeBadge);
+            document.getElementById('headerUsername').textContent = badgeLabel ? (currentUsername + ' • ' + badgeLabel) : currentUsername;
             document.getElementById('headerCash').textContent = formatCurrency(currentCash);
             document.getElementById('cashDisplay').textContent = formatCurrency(currentCash);
+            const avatarEl = document.getElementById('headerAvatar');
+            if (avatarEl) {
+                if (currentAvatarUrl) {
+                    avatarEl.src = currentAvatarUrl;
+                    avatarEl.alt = currentUsername + ' avatar';
+                } else {
+                    avatarEl.removeAttribute('src');
+                }
+            }
         }
 
         async function refreshPortfolio() {
@@ -2903,6 +4525,8 @@ app.get('/', (req, res) => {
                     currentPortfolio = data.portfolio;
                     dailyBonusState = data.dailyBonus || dailyBonusState;
                     watchlistSymbols = data.watchlist || watchlistSymbols;
+                    currentCoins = data.coins || currentCoins;
+                    activeBadge = data.activeBadge || activeBadge;
                     updateHeader();
                     updateQuickPortfolio();
                     renderDailyBonus(dailyBonusState);
@@ -3452,6 +5076,12 @@ app.get('/', (req, res) => {
                 await loadLeaderboardTab();
             } else if (tabName === 'history') {
                 await loadHistoryTab();
+            } else if (tabName === 'profile') {
+                await loadProfileTab();
+            } else if (tabName === 'forum') {
+                await loadForumTab();
+            } else if (tabName === 'explorer') {
+                await loadExplorerTab();
             }
         }
 
@@ -3520,7 +5150,11 @@ app.get('/', (req, res) => {
 
         async function loadLeaderboardTab() {
             const container = document.getElementById('leaderboardList');
+            const coinContainer = document.getElementById('coinLeaderboardList');
             container.innerHTML = '<div class="loading">Loading...</div>';
+            if (coinContainer) {
+                coinContainer.innerHTML = '<div class="loading">Loading...</div>';
+            }
 
             try {
                 const response = await fetch('/api/leaderboard');
@@ -3545,6 +5179,30 @@ app.get('/', (req, res) => {
                 container.innerHTML = html;
             } catch (error) {
                 container.innerHTML = '<div class="empty-state"><p>Error loading leaderboard</p></div>';
+            }
+
+            if (!coinContainer) return;
+            try {
+                const response = await fetch('/api/leaderboard/coins');
+                const data = await response.json();
+
+                if (!Array.isArray(data) || data.length === 0) {
+                    coinContainer.innerHTML = '<div class="empty-state"><p>No coin leaders yet</p></div>';
+                    return;
+                }
+
+                let html = '';
+                data.forEach((user, index) => {
+                    html += '<div class="leaderboard-item">'
+                        + '<div class="leaderboard-rank">#' + (index + 1) + '</div>'
+                        + '<div class="leaderboard-user">' + user.username + '</div>'
+                        + '<div class="leaderboard-value">' + user.coins + 'c</div>'
+                        + '</div>';
+                });
+
+                coinContainer.innerHTML = html;
+            } catch (error) {
+                coinContainer.innerHTML = '<div class="empty-state"><p>Error loading coin leaderboard</p></div>';
             }
         }
 
